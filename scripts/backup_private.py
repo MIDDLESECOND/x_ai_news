@@ -37,6 +37,34 @@ def git(*args):
                           encoding="utf-8", errors="replace")
 
 
+def gh(*args):
+    exe = shutil.which("gh")
+    if not exe:
+        return None
+    return subprocess.run([exe, *args], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+
+
+class GhAccount:
+    """gh 凭据助手只认当前活跃账号（不按 URL 用户名路由，2026-08-02 实测）。
+    推送前切到 MIDDLESECOND，完毕后还原，避免干扰用户日常使用的另一账号。"""
+    NEEDED = "MIDDLESECOND"
+
+    def __enter__(self):
+        self.prev = None
+        r = gh("api", "user", "--jq", ".login")
+        if r and r.returncode == 0:
+            active = r.stdout.strip()
+            if active and active != self.NEEDED:
+                self.prev = active
+                gh("auth", "switch", "-u", self.NEEDED)
+        return self
+
+    def __exit__(self, *exc):
+        if self.prev:
+            gh("auth", "switch", "-u", self.prev)
+
+
 def main():
     if not (BACKUP_REPO / ".git").exists():
         sys.exit(f"{BACKUP_REPO} 不是 git 仓库——先按 README 初始化备份仓库")
@@ -59,9 +87,10 @@ def main():
     r = git("commit", "-m", f"backup {date.today().isoformat()}")
     if r.returncode != 0:
         sys.exit(f"commit 失败：{r.stderr[-300:]}")
-    p = git("push")
+    with GhAccount():
+        p = git("push")
     if p.returncode != 0:
-        sys.exit(f"push 失败（本地提交已保留）：{p.stderr[-300:]}")
+        sys.exit(f"push 失败（本地提交已保留，下次运行会重推）：{p.stderr[-300:]}")
     print(f"已备份 {copied} 项并推送 -> x_ai_news_private")
 
 
