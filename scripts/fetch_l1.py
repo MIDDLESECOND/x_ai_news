@@ -241,6 +241,32 @@ def fetch_html_stub(src):
     }]
 
 
+def fetch_github_search(src):
+    """GitHub 仓库检索：只报最近 N 天新建的匹配仓库（发现新审计/雷达/基准项目）。
+    活跃老仓库不重复报——发现管道要的是'新出现'，不是'又更新'。"""
+    days = src.get("created_within_days", 14)
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+    reported = load_state("gh_audit_seen")  # 每个仓库只报第一次发现，不连报 14 天
+    seen, items = set(), []
+    for q in src.get("queries", []):
+        query = requests.utils.quote(f"{q} created:>={since}")
+        resp = http_get(f"{src['url']}?q={query}&sort=updated&per_page=5",
+                        accept="application/vnd.github+json")
+        for r in resp.json().get("items", []):
+            if r["full_name"] in seen or r["full_name"] in reported:
+                continue
+            seen.add(r["full_name"])
+            reported[r["full_name"]] = datetime.now(timezone.utc).date().isoformat()
+            items.append({
+                "title": f"[新审计/基准项目] {r['full_name']}（★{r['stargazers_count']}）",
+                "url": r["html_url"],
+                "published": r.get("created_at", ""),
+                "summary": (r.get("description") or "")[:300] + f"（检索词：{q}）",
+            })
+    save_state("gh_audit_seen", reported)
+    return items
+
+
 def fetch_yahoo_chart(src):
     """港股/美股行情（Yahoo chart API）→ 单条行情条目。"""
     res = http_get(src["url"]).json()["chart"]["result"][0]
@@ -385,6 +411,7 @@ FETCHERS = {
     "hf_papers": fetch_hf_papers,
     "github_repos": fetch_github_repos,
     "html_stub": fetch_html_stub,
+    "github_search": fetch_github_search,
     "yahoo_chart": fetch_yahoo_chart,
     "statuspage": fetch_statuspage,
     "openrouter_prices": fetch_openrouter_prices,

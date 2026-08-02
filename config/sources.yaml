@@ -248,3 +248,31 @@ sources:
     url: "https://huggingface.co/api/models?author=Qwen&sort=lastModified&direction=-1&limit=10"
     tier: official
     enabled: true
+
+  # ---- 社区审计与降智叙事的源头监视（2026-08-02 起，源于量子位/X 方法论帖类内容）----
+  - id: anthropic_engineering
+    name: Anthropic 工程博客
+    type: html_stub           # postmortem（如 4/23 三 bug 自曝）的第一落点；哈希比对，变更才进简报
+    url: https://www.anthropic.com/engineering
+    tier: official
+    enabled: true
+
+  - id: bridgebench
+    name: BridgeBench Releases
+    type: rss                 # 盲评编程基准（bridge-mind/bridgebench，★118）；发版即新一轮排名
+    url: https://github.com/bridge-mind/bridgebench/releases.atom
+    tier: index
+    enabled: true
+
+  - id: gh_audit_search
+    name: GitHub 新审计/基准项目雷达
+    type: github_search       # 只报最近 14 天新建仓库——Laurenzo 式会话审计、NerfWatch 式探针的自动发现管道
+    url: https://api.github.com/search/repositories
+    queries:
+      - claude degradation
+      - llm degradation audit
+      - model benchmark degradation
+      - claude code audit
+    created_within_days: 14
+    tier: community
+    enabled: true
