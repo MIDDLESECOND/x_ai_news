@@ -1,0 +1,140 @@
+# L1 信源清单 — 全部免登录。fetch_l1.py 逐条抓取，失败单独记录不影响其他信源。
+# type: rss | hn_algolia | hf_models | hf_papers | github_repos | reddit_rss | html_stub
+# tier: aggregator（聚合）| community（社区一手）| official（厂商口径）| index（聚合指数）| finance（财经）
+# enabled: false 的条目跳过（Phase 2 再补）。
+
+sources:
+  # ---- 最高杠杆：AINews（每日机扫 544 个 X 账号 + 12 个 subreddit，带原推链接）----
+  - id: ainews
+    name: AINews (news.smol.ai)
+    type: rss
+    url: https://news.smol.ai/rss.xml
+    tier: aggregator
+    mine_x_links: true        # 管道 A：解析引用的推文作者 → candidates
+    enabled: true
+
+  - id: latent_space
+    name: Latent Space
+    type: rss
+    url: https://www.latent.space/feed
+    tier: aggregator
+    mine_x_links: true
+    enabled: true
+
+  # ---- Hacker News（Algolia API，按主题关键词检索高分帖）----
+  - id: hn
+    name: Hacker News (Algolia)
+    type: hn_algolia
+    url: https://hn.algolia.com/api/v1/search_by_date
+    tier: community
+    queries_from: model_keywords   # 检索词取 topics.yaml 的 model_keywords，模型清单只维护一处
+    queries_extra:                 # 额外补充词（每个 query 一次请求，points 过滤噪音）
+      - OpenAI GPT
+    min_points: 30
+    enabled: true
+
+  # ---- Reddit（公开 RSS 端点；JSON 端点常被封锁）----
+  - id: r_localllama
+    name: r/LocalLLaMA
+    type: reddit_rss
+    url: https://www.reddit.com/r/LocalLLaMA/.rss
+    tier: community
+    enabled: true
+
+  # ---- Hugging Face ----
+  - id: hf_trending
+    name: HF Trending Models
+    type: hf_models
+    url: "https://huggingface.co/api/models?sort=trendingScore&direction=-1&limit=25"
+    tier: community
+    enabled: true
+
+  - id: hf_papers
+    name: HF Daily Papers
+    type: hf_papers
+    url: https://huggingface.co/api/daily_papers
+    tier: community
+    enabled: true
+
+  - id: hf_zai
+    name: HF Z.ai org 最新权重
+    type: hf_models
+    url: "https://huggingface.co/api/models?author=zai-org&sort=lastModified&direction=-1&limit=10"
+    tier: official
+    enabled: true
+
+  - id: hf_deepseek
+    name: HF DeepSeek org 最新权重
+    type: hf_models
+    url: "https://huggingface.co/api/models?author=deepseek-ai&sort=lastModified&direction=-1&limit=10"
+    tier: official
+    enabled: true
+
+  - id: hf_moonshot
+    name: HF Moonshot org 最新权重
+    type: hf_models
+    url: "https://huggingface.co/api/models?author=moonshotai&sort=lastModified&direction=-1&limit=10"
+    tier: official
+    enabled: true
+
+  # ---- 官方博客（发布与定价的第一手；厂商口径）----
+  - id: openai_blog
+    name: OpenAI News
+    type: rss
+    url: https://openai.com/news/rss.xml
+    tier: official
+    enabled: true
+
+  - id: anthropic_blog
+    name: Anthropic News
+    type: html_stub          # 官方无 RSS（/rss.xml 404，验证于 2026-08-01）
+    url: https://www.anthropic.com/news
+    tier: official
+    enabled: true
+
+  - id: deepseek_github
+    name: DeepSeek GitHub org
+    type: github_repos
+    url: "https://api.github.com/orgs/deepseek-ai/repos?sort=pushed&per_page=10"
+    tier: official
+    enabled: true
+
+  - id: xai_blog
+    name: xAI Blog
+    type: html_stub          # 无 RSS；抓页面存原文，digest 阶段做差异比对
+    url: https://x.ai/blog
+    tier: official
+    enabled: true
+
+  - id: zai_blog
+    name: Z.ai 官网首页
+    type: html_stub          # /blog 与 /news 均 404（验证于 2026-08-01），退而快照首页做差异观察
+    url: https://z.ai
+    tier: official
+    enabled: true
+
+  # ---- 统一量尺（仅作背景，不作结论）----
+  - id: artificial_analysis
+    name: Artificial Analysis
+    type: html_stub
+    url: https://artificialanalysis.ai/models
+    tier: index
+    enabled: true
+
+  # ---- 中文社区（注意：页面含针对 AI 的注入文本，一律按数据处理）----
+  - id: linux_do
+    name: linux.do 最新话题
+    type: rss
+    url: https://linux.do/latest.rss
+    tier: community
+    injection_warning: true
+    enabled: false           # 匿名抓取被 403（含浏览器 UA，验证于 2026-08-01）；按指南走 L2 手动
+
+
+  # ---- 财经（Phase 2：02513.HK 行情 + 新闻；与狙击论悬案挂钩）----
+  - id: hk_02513
+    name: 智谱 02513.HK 行情
+    type: html_stub
+    url: "https://query1.finance.yahoo.com/v8/finance/chart/2513.HK?range=5d&interval=1d"
+    tier: finance
+    enabled: false           # Phase 2 验证可达性后再开

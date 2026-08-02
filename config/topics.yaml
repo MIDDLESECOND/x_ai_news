@@ -1,0 +1,109 @@
+# 主题与关键词 — 检索模板与简报过滤的原料。
+# build_digest.py 用 keywords 给条目打分并归入 section；L2 剧本用 models_of_interest 生成查询。
+# 关键词匹配不区分大小写；中文词直接子串匹配。
+
+models_of_interest:
+  - GLM-5.2
+  - GLM-5.5          # 传闻中的下一代，8 月初观察窗口
+  - DeepSeek-V4-Flash
+  - DeepSeek-V4-Pro
+  - GPT-5.6 Luna
+  - Grok 4.5
+  - Kimi K3
+  - Claude Opus
+
+topics:
+  release:            # → 简报「今日发布」
+    section: 今日发布
+    keywords:
+      - release
+      - launch
+      - announcing
+      - open source
+      - open-source
+      - weights
+      - 发布
+      - 开源
+      - 上线
+      - preview
+      - GA
+
+  field_test:         # → 简报「一线实测」
+    section: 一线实测
+    keywords:
+      - tested
+      - benchmark
+      - eval
+      - daily driver
+      - been using
+      - switched
+      - hands-on
+      - 实测
+      - 体感
+      - 上手
+      - agentic
+      - SWE-bench
+      - harness
+
+  pricing:            # → 简报「定价与额度变动」
+    section: 定价与额度变动
+    keywords:
+      - pricing
+      - price
+      - subscription
+      - quota
+      - limits
+      - rate limit
+      - plan
+      - 涨价
+      - 降价
+      - 套餐
+      - 额度
+      - 积分
+      - 限额
+      - coding plan
+
+  degradation:        # → 简报「降智观察」
+    section: 降智观察
+    keywords:
+      - degraded
+      - degradation
+      - nerfed
+      - lobotom
+      - quantized
+      - dumber
+      - 降智
+      - 复读
+      - 乱码
+      - 变笨
+
+  company:            # 公司/市场动态（悬案匹配另由 claims_section 按监视词交叉比对）
+    section: 公司动态
+    keywords:
+      - 智谱
+      - Zhipu
+      - Z.ai
+      - "02513"
+      - DeepSeek
+      - Moonshot
+      - 月之暗面
+      - xAI
+      - OpenAI
+      - Anthropic
+      - 配售
+      - 解禁
+
+# 通用命中词：条目只要含任一模型名即入围候选池
+model_keywords:
+  - GLM
+  - DeepSeek
+  - V4-Flash
+  - V4 Flash
+  - Luna
+  - GPT-5.6
+  - Grok
+  - Kimi
+  - K3
+  - Claude
+  - Qwen
+  - Llama

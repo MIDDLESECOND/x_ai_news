@@ -1,0 +1,20 @@
+# 密钥与环境
+.env
+__pycache__/
+*.pyc
+.venv/
+
+# ---- 私有层：不入公开仓库，本地照常使用 ----
+# 抓取数据与累积状态（含真实个人账号的记账）
+data/
+# 每日简报（内容源自私有的悬案账本）
+briefs/
+# X 深挖方法论与信源发现规则
+playbooks/
+# 项目指南（含 L2 操作细节）
+docs/
+# 专题验证报告（含对具名个人的评判）
+reports/
+# 记忆核心：悬案账本与账号库（含立场标注）
+config/claims.yaml
+config/accounts.yaml
