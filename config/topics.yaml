@@ -80,6 +80,7 @@ topics:
       - incident
       - outage
       - CodexRadar   # 降智雷达条目
+      - 账号探针     # 自托管订阅端点探针条目
 
   company:            # 公司/市场动态（悬案匹配另由 claims_section 按监视词交叉比对）
     section: 公司动态

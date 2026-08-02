@@ -176,6 +176,20 @@ sources:
     tier: official
     enabled: true
 
+  - id: anthropic_pricing
+    name: Claude 订阅定价页
+    type: html_stub           # 需求方自用订阅（Max 20x）——套餐调价第一时间捕获
+    url: https://claude.com/pricing
+    tier: official
+    enabled: true
+
+  - id: openai_pricing
+    name: OpenAI 定价文档页
+    type: html_stub           # 消费者套餐页匿名不可达（验证于 2026-08-02）；套餐级变动另靠 r/ChatGPTCoding + 官方博客
+    url: https://platform.openai.com/docs/pricing
+    tier: official
+    enabled: true
+
   # ---- 降智雷达（社区固定任务集；数据仅私有研究引用，不再分发——见其 README 授权说明）----
   - id: codexradar
     name: CodexRadar

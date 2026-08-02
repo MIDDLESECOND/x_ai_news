@@ -18,3 +18,5 @@ reports/
 # 记忆核心：悬案账本与账号库（含立场标注）
 config/claims.yaml
 config/accounts.yaml
+# 账号级降智探针（任务集私藏，防针对性训练）
+probes/

@@ -416,7 +416,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", default=date.today().isoformat())
     ap.add_argument("--keep-days", type=int, default=45, help="data/raw 保留天数（默认 45）")
+    ap.add_argument("--only", default="", help="只抓这些信源（逗号分隔的 id，测试用）")
     args = ap.parse_args()
+    only = {s.strip() for s in args.only.split(",") if s.strip()}
 
     cfg = yaml.safe_load((ROOT / "config" / "sources.yaml").read_text(encoding="utf-8"))
     topics_path = ROOT / "config" / "topics.yaml"
@@ -428,6 +430,8 @@ def main():
     log = {"date": args.date, "fetched_at": datetime.now(timezone.utc).isoformat(), "sources": {}}
     ok = failed = 0
     for src in cfg["sources"]:
+        if only and src["id"] not in only:
+            continue
         if not src.get("enabled", True):
             log["sources"][src["id"]] = {"status": "skipped"}
             continue
@@ -467,11 +471,12 @@ def main():
             print(f"[fail] {src['id']}: {type(e).__name__}: {e}")
             failed += 1
 
-    (out_dir / "_fetch_log.json").write_text(
-        json.dumps(log, ensure_ascii=False, indent=1), encoding="utf-8")
-    pruned = prune_raw(args.keep_days, args.date)
-    if pruned:
-        print(f"已清理 {len(pruned)} 个过期 raw 目录：{', '.join(pruned)}")
+    if not only:  # --only 是局部测试，不覆盖全量日志、不触发保留清理
+        (out_dir / "_fetch_log.json").write_text(
+            json.dumps(log, ensure_ascii=False, indent=1), encoding="utf-8")
+        pruned = prune_raw(args.keep_days, args.date)
+        if pruned:
+            print(f"已清理 {len(pruned)} 个过期 raw 目录：{', '.join(pruned)}")
     print(f"\n{ok} ok, {failed} failed -> {out_dir}")
     return 0 if ok > 0 else 1
 
