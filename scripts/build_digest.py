@@ -31,7 +31,7 @@ from fetch_l1 import X_RESERVED_PATHS  # 与挖掘层共用保留路径清单
 ROOT = Path(__file__).resolve().parent.parent
 TIER_LABEL = {
     "aggregator": "聚合", "community": "社区一手", "official": "厂商口径",
-    "index": "聚合指数", "finance": "财经",
+    "index": "聚合指数", "finance": "财经", "radar": "独立雷达",
 }
 SECTION_ORDER = ["今日发布", "一线实测", "定价与额度变动", "降智观察", "公司动态"]
 # 与 fetch_l1 序列化的 x.com/<handle>/status/<id> 形式对应（handle 规则与 X_LINK_RE 一致）

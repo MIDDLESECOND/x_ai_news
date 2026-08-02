@@ -76,6 +76,10 @@ topics:
       - 复读
       - 乱码
       - 变笨
+      - 服务事故     # statuspage 事故条目
+      - incident
+      - outage
+      - CodexRadar   # 降智雷达条目
 
   company:            # 公司/市场动态（悬案匹配另由 claims_section 按监视词交叉比对）
     section: 公司动态

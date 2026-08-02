@@ -14,6 +14,7 @@ import json
 import re
 import shutil
 import sys
+import time
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -30,6 +31,7 @@ X_LINK_RE = re.compile(r"https?://(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})/status
 # X 的保留路径段（x.com/i/status/... 等非用户名路径），挖掘时即过滤
 X_RESERVED_PATHS = {"i", "search", "home", "intent", "hashtag", "explore", "share"}
 TAG_RE = re.compile(r"<[^>]+>")
+SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
 
 if sys.stdout:  # pythonw / stdout 分离的无控制台运行下 sys.stdout 为 None
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -40,6 +42,10 @@ def http_get(url, accept=None):
     if accept:
         headers["Accept"] = accept
     resp = requests.get(url, headers=headers, timeout=TIMEOUT)
+    if resp.status_code == 429:  # 限流：按 Retry-After（上限 60s）退避一次
+        wait = min(int(resp.headers.get("Retry-After", 30) or 30), 60)
+        time.sleep(wait)
+        resp = requests.get(url, headers=headers, timeout=TIMEOUT)
     resp.raise_for_status()
     return resp
 
@@ -193,35 +199,38 @@ def fetch_github_repos(src):
     return items
 
 
-def _load_snapshot_state():
-    p = STATE_DIR / "html_snapshots.json"
+def load_state(name):
+    """data/state/<name>.json —— 跨日状态（快照哈希、价格基线、雷达 IQ 等）。损坏时重建。"""
+    p = STATE_DIR / f"{name}.json"
     if p.exists():
         try:
             return json.loads(p.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            print("[warn] html_snapshots.json 损坏，重建快照状态")
+            print(f"[warn] state/{name}.json 损坏，重建")
     return {}
 
 
-def _save_snapshot_state(state):
+def save_state(name, obj):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_DIR / "html_snapshots.json.tmp"
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(STATE_DIR / "html_snapshots.json")
+    tmp = STATE_DIR / f"{name}.json.tmp"
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(STATE_DIR / f"{name}.json")
 
 
 def fetch_html_stub(src):
     """页面快照 + 跨日哈希比对：内容未变的快照标 changed=false，digest 不收入简报。"""
     resp = http_get(src["url"])
-    text = re.sub(r"\s+", " ", strip_tags(resp.text))
+    if resp.encoding in (None, "ISO-8859-1"):  # 无 charset 头时 requests 默认 latin-1，中文站会乱码
+        resp.encoding = resp.apparent_encoding or "utf-8"
+    text = re.sub(r"\s+", " ", strip_tags(SCRIPT_STYLE_RE.sub(" ", resp.text)))
     sha = hashlib.sha256(resp.content).hexdigest()
-    state = _load_snapshot_state()
+    state = load_state("html_snapshots")
     prev = state.get(src["id"])
     changed = prev is None or prev.get("sha") != sha
     now = datetime.now(timezone.utc).isoformat()
     if changed:
         state[src["id"]] = {"sha": sha, "last_changed": now}
-        _save_snapshot_state(state)
+        save_state("html_snapshots", state)
     return [{
         "title": ("[页面有更新] " if changed and prev else "[页面快照] ") + src["name"],
         "url": src["url"],
@@ -232,6 +241,142 @@ def fetch_html_stub(src):
     }]
 
 
+def fetch_yahoo_chart(src):
+    """港股/美股行情（Yahoo chart API）→ 单条行情条目。"""
+    res = http_get(src["url"]).json()["chart"]["result"][0]
+    meta = res["meta"]
+    sym = meta.get("symbol", "")
+    price = meta.get("regularMarketPrice")
+    closes = res.get("indicators", {}).get("quote", [{}])[0].get("close") or []
+    valid = [c for c in closes if c is not None]
+    # 日变动以序列中最近两个收盘为基准（meta 的 chartPreviousClose 是区间前收，跨多日会失真）
+    chg = f"{(valid[-1] - valid[-2]) / valid[-2] * 100:+.2f}%" if len(valid) >= 2 else "n/a"
+    days = "，".join(
+        f"{datetime.fromtimestamp(t, timezone.utc).date()}: {c:.2f}"
+        for t, c in zip(res.get("timestamp") or [], closes) if c is not None)
+    return [{
+        "title": f"{src['name']}：{price}（较上一交易日 {chg}）",
+        "url": f"https://finance.yahoo.com/quote/{sym}",
+        "published": datetime.now(timezone.utc).isoformat(),
+        "summary": f"symbol={sym} last={price}；近 5 日收盘：{days}",
+    }]
+
+
+def fetch_statuspage(src):
+    """statuspage.io 标准 summary.json → 每个未解决事故一条；全绿则 0 条（不是错误）。"""
+    d = http_get(src["url"]).json()
+    items = []
+    for inc in d.get("incidents", []):
+        upd = (inc.get("incident_updates") or [{}])[0].get("body", "")
+        items.append({
+            "title": f"[服务事故] {src['name']}: {inc.get('name', '')}（{inc.get('impact', '')}/{inc.get('status', '')}）",
+            "url": inc.get("shortlink") or d.get("page", {}).get("url", src["url"]),
+            "published": inc.get("started_at") or inc.get("created_at") or "",
+            "summary": strip_tags(upd)[:500],
+        })
+    ind = d.get("status", {}).get("indicator")
+    if not items and ind not in (None, "none"):
+        items.append({
+            "title": f"[服务事故] {src['name']}: {d['status'].get('description', ind)}",
+            "url": d.get("page", {}).get("url", src["url"]),
+            "published": datetime.now(timezone.utc).isoformat(),
+            "summary": f"indicator={ind}",
+        })
+    return items
+
+
+def fetch_openrouter_prices(src):
+    """OpenRouter 全模型牌价 → 与上次基线 diff，只报变动/新上架（首跑建基线）。
+    只追踪命中 topics.yaml model_keywords 的模型。"""
+    data = http_get(src["url"]).json().get("data", [])
+    kws = [k.lower() for k in src.get("_model_keywords", [])]
+    tracked = {}
+    for m in data:
+        mid = m.get("id") or ""
+        name = m.get("name") or mid
+        hay = f"{mid.lower()} {name.lower()}"
+        if not any(k in hay for k in kws):
+            continue
+        pr = m.get("pricing") or {}
+        try:
+            tracked[mid] = {"name": name,
+                            "prompt": round(float(pr.get("prompt") or 0) * 1e6, 4),
+                            "completion": round(float(pr.get("completion") or 0) * 1e6, 4)}
+        except (TypeError, ValueError):
+            continue
+    state = load_state("openrouter_prices")
+    now = datetime.now(timezone.utc).isoformat()
+    items = []
+    if not state:
+        items.append({
+            "title": f"[OpenRouter] pricing 基线已建立，追踪 {len(tracked)} 个模型牌价",
+            "url": "https://openrouter.ai/models", "published": now,
+            "summary": "首日快照；此后任何被追踪模型的输入/输出牌价变动将逐条列出",
+        })
+    else:
+        for mid, cur in tracked.items():
+            old = state.get(mid)
+            if old is None:
+                items.append({
+                    "title": f"[OpenRouter] new listing: {cur['name']}（${cur['prompt']:.2f}/${cur['completion']:.2f} per M）",
+                    "url": f"https://openrouter.ai/{mid}", "published": now,
+                    "summary": "新模型上架 OpenRouter（发布信号）",
+                })
+            elif (cur["prompt"], cur["completion"]) != (old.get("prompt"), old.get("completion")):
+                items.append({
+                    "title": (f"[OpenRouter] pricing change: {cur['name']} "
+                              f"${old.get('prompt')}/${old.get('completion')} → "
+                              f"${cur['prompt']}/${cur['completion']} per M"),
+                    "url": f"https://openrouter.ai/{mid}", "published": now,
+                    "summary": "输入/输出牌价（每百万 token）变动",
+                })
+    save_state("openrouter_prices", tracked)
+    return items[:20]
+
+
+def fetch_codexradar(src):
+    """CodexRadar 每日固定任务集（112 任务/档）。IQ 相比上次变动超阈值的档位逐条报告；
+    另出一条当日快照。数据仅私有研究引用，不再分发（见其 README 授权说明）。"""
+    d = http_get(src["url"]).json()
+    pts = d.get("points") or []
+    updated = d.get("source_updated_at") or datetime.now(timezone.utc).isoformat()
+    state = load_state("codexradar")
+    threshold = src.get("iq_delta_threshold", 2.0)
+    items, new_state = [], {}
+    for p in pts:
+        iq = p.get("iq")
+        if iq is None:
+            continue
+        key = f"{p.get('model')}|{p.get('effort')}"
+        new_state[key] = iq
+        old = state.get(key)
+        if old is not None and abs(iq - old) >= threshold:
+            items.append({
+                "title": f"[CodexRadar] {p['model']} {p['effort']}: IQ {old:.1f}→{iq:.1f}（{iq - old:+.1f}）",
+                "url": "https://codexradar.com",
+                "published": updated,
+                "summary": (f"passed {p.get('passed')}/{p.get('valid_tasks')}；"
+                            f"均价 ${p.get('average_price_usd', 0):.3f}/任务；"
+                            f"均时 {p.get('average_minutes', 0):.1f} 分钟"),
+            })
+    def best_line(model):
+        rows = [p for p in pts if p.get("model") == model and p.get("iq") is not None]
+        if not rows:
+            return None
+        top = max(rows, key=lambda p: p["iq"])
+        return f"{model} 最高档 IQ {top['iq']:.1f}（${top.get('average_price_usd', 0):.2f}/任务）"
+    lines = [x for x in (best_line(m) for m in src.get("summary_models", [])) if x]
+    if lines:
+        items.append({
+            "title": "[CodexRadar] 每日固定任务集快照：" + "；".join(lines),
+            "url": "https://codexradar.com",
+            "published": updated,
+            "summary": f"112 任务同 harness；源更新于 {updated}",
+        })
+    save_state("codexradar", new_state)
+    return items
+
+
 FETCHERS = {
     "rss": fetch_rss,
     "reddit_rss": fetch_rss,
@@ -240,6 +385,10 @@ FETCHERS = {
     "hf_papers": fetch_hf_papers,
     "github_repos": fetch_github_repos,
     "html_stub": fetch_html_stub,
+    "yahoo_chart": fetch_yahoo_chart,
+    "statuspage": fetch_statuspage,
+    "openrouter_prices": fetch_openrouter_prices,
+    "codexradar": fetch_codexradar,
 }
 
 
@@ -282,10 +431,14 @@ def main():
         if not src.get("enabled", True):
             log["sources"][src["id"]] = {"status": "skipped"}
             continue
-        # 检索词从 topics.yaml 派生，模型清单只维护一处
+        # 检索词/追踪清单从 topics.yaml 派生，模型清单只维护一处
         if src.get("queries_from") == "model_keywords":
             src["queries"] = list(dict.fromkeys(
                 (topics_cfg.get("model_keywords") or []) + src.get("queries_extra", [])))
+        if src["type"] == "openrouter_prices":
+            src["_model_keywords"] = topics_cfg.get("model_keywords") or []
+        if src.get("delay_before"):  # 同域信源限流（如 Reddit 连续请求 429）
+            time.sleep(src["delay_before"])
         fetcher = FETCHERS.get(src["type"])
         if fetcher is None:
             log["sources"][src["id"]] = {"status": "error", "error": f"unknown type {src['type']}"}
@@ -293,6 +446,11 @@ def main():
             continue
         try:
             items = fetcher(src)
+            kif = src.get("keep_if_contains")  # 高频低信噪信源（如 llama.cpp CI 构建）按关键词过滤
+            if kif:
+                items = [it for it in items
+                         if any(t.lower() in f"{it.get('title', '')} {it.get('summary', '')}".lower()
+                                for t in kif)]
             payload = {
                 "source": src["id"], "name": src["name"], "tier": src["tier"],
                 "injection_warning": src.get("injection_warning", False),

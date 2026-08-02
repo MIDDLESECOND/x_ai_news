@@ -12,7 +12,7 @@
 python scripts/fetch_l1.py && python scripts/build_digest.py
 ```
 
-产出 `briefs/YYYY-MM-DD.md`，七个栏目：今日发布／一线实测／定价与额度变动／降智观察／公司动态／悬案更新／新信源候选。全部信源为免登录公开端点（AINews、HN Algolia、Reddit RSS、Hugging Face API、厂商官网、Artificial Analysis），配置在 [config/sources.yaml](config/sources.yaml)，单信源失败不影响整体。
+产出 `briefs/YYYY-MM-DD.md`，七个栏目：今日发布／一线实测／定价与额度变动／降智观察／公司动态／悬案更新／新信源候选。全部信源为免登录公开端点（27 个：AINews、HN Algolia、Reddit RSS、Hugging Face API、厂商官网与定价页、服务状态页 JSON、OpenRouter 牌价（跨日 diff 只报变动）、Yahoo 行情、CodexRadar 降智雷达（IQ 序列追踪；其数据仅私有研究引用）、Aider 排行榜、llama.cpp Releases 等），配置在 [config/sources.yaml](config/sources.yaml)，单信源失败不影响整体。
 
 - `--llm`：摘要正文由 Claude API 生成（需 `ANTHROPIC_API_KEY` 或 `ant auth login` 登录态；失败或输出被截断时自动回退机械聚合版，逐条链接的机械列表任何情况下都保留）。
 - `--window N`：只收录最近 N 天条目（默认 3，用于收敛全历史 feed）。

@@ -131,10 +131,106 @@ sources:
     enabled: false           # 匿名抓取被 403（含浏览器 UA，验证于 2026-08-01）；按指南走 L2 手动
 
 
-  # ---- 财经（Phase 2：02513.HK 行情 + 新闻；与狙击论悬案挂钩）----
+  # ---- 财经（与狙击论悬案挂钩；2026-08-02 验证可达并启用）----
   - id: hk_02513
     name: 智谱 02513.HK 行情
-    type: html_stub
+    type: yahoo_chart
     url: "https://query1.finance.yahoo.com/v8/finance/chart/2513.HK?range=5d&interval=1d"
     tier: finance
-    enabled: false           # Phase 2 验证可达性后再开
+    enabled: true
+
+  # ---- 服务状态页（降智观察的客观代理：statuspage.io 标准 JSON；全绿时 0 条属正常）----
+  - id: status_openai
+    name: OpenAI 状态页
+    type: statuspage
+    url: https://status.openai.com/api/v2/summary.json
+    tier: official
+    enabled: true
+
+  - id: status_anthropic
+    name: Anthropic 状态页
+    type: statuspage
+    url: https://status.anthropic.com/api/v2/summary.json
+    tier: official
+    enabled: true
+
+  # ---- 定价直接监测 ----
+  - id: openrouter
+    name: OpenRouter 牌价
+    type: openrouter_prices   # 免鉴权全模型牌价；按 topics model_keywords 过滤，跨日 diff 只报变动
+    url: https://openrouter.ai/api/v1/models
+    tier: index
+    enabled: true
+
+  - id: zhipu_pricing
+    name: 智谱开放平台定价页
+    type: html_stub           # 哈希比对，变了才进简报——Coding Plan 调价第一时间捕获
+    url: https://open.bigmodel.cn/pricing
+    tier: official
+    enabled: true
+
+  - id: deepseek_pricing
+    name: DeepSeek 定价文档页
+    type: html_stub
+    url: https://api-docs.deepseek.com/quick_start/pricing
+    tier: official
+    enabled: true
+
+  # ---- 降智雷达（社区固定任务集；数据仅私有研究引用，不再分发——见其 README 授权说明）----
+  - id: codexradar
+    name: CodexRadar
+    type: codexradar
+    url: https://codexradar.com/data/intelligence-efficiency.json
+    tier: radar
+    iq_delta_threshold: 2.0   # 单档 IQ 变动超此值才单独报告
+    summary_models:           # 每日快照里点名的模型
+      - gpt-5.6-sol
+      - gpt-5.6-luna
+      - deepseek-v4-flash
+    enabled: true
+
+  # ---- 订阅党社区（额度/降智风向）----
+  - id: r_claudeai
+    name: r/ClaudeAI
+    type: reddit_rss
+    url: https://www.reddit.com/r/ClaudeAI/.rss
+    tier: community
+    delay_before: 6           # Reddit 同域连续请求会 429
+    enabled: true
+
+  - id: r_chatgptcoding
+    name: r/ChatGPTCoding
+    type: reddit_rss
+    url: https://www.reddit.com/r/ChatGPTCoding/.rss
+    tier: community
+    delay_before: 30          # 排在 r_claudeai 之后，需更长同域间隔
+    enabled: true
+
+  # ---- 编程模型独立量尺与本地生态 ----
+  - id: aider_leaderboard
+    name: Aider 编程排行榜
+    type: html_stub
+    url: https://aider.chat/docs/leaderboards/
+    tier: index
+    enabled: true
+
+  - id: llamacpp_releases
+    name: llama.cpp Releases
+    type: rss
+    url: https://github.com/ggml-org/llama.cpp/releases.atom
+    tier: community
+    keep_if_contains:        # 每日 CI 构建量大，只留提及追踪模型/工具调用的版本
+      - DeepSeek
+      - GLM
+      - Kimi
+      - Qwen
+      - tool call
+      - V4
+    enabled: true
+
+  - id: hf_qwen
+    name: HF Qwen org 最新权重
+    type: hf_models
+    url: "https://huggingface.co/api/models?author=Qwen&sort=lastModified&direction=-1&limit=10"
+    tier: official
+    enabled: true
