@@ -215,9 +215,32 @@ sources:
   - id: r_chatgptcoding
     name: r/ChatGPTCoding
     type: reddit_rss
-    url: https://www.reddit.com/r/ChatGPTCoding/new/.rss   # new 排序；该 sub 近乎枯竭（约月更），候补替换见 accounts.yaml
+    url: https://www.reddit.com/r/ChatGPTCoding/new/.rss
     tier: community
-    delay_before: 30          # 排在 r_claudeai 之后，需更长同域间隔
+    delay_before: 30
+    enabled: false            # 信源枯竭（约月更，实测 2026-08-02），由 r_codex 系替代
+
+  - id: r_codex
+    name: r/codex
+    type: reddit_rss
+    url: https://www.reddit.com/r/codex/new/.rss   # OpenAI 订阅党主阵地：额度/降智风向密度极高（2026-08-02 实测半天 25 帖）
+    tier: community
+    delay_before: 30          # Reddit 同域第三个请求，需长间隔
+    enabled: true
+
+  - id: r_openaicodex
+    name: r/OpenAIcodex
+    type: reddit_rss
+    url: https://www.reddit.com/r/OpenAIcodex/new/.rss   # 与 r/codex 同社群分流，上下文缩水/额度燃烧类一手帖
+    tier: community
+    delay_before: 30
+    enabled: true
+
+  - id: openai_devforum
+    name: OpenAI 开发者论坛
+    type: rss
+    url: https://community.openai.com/latest.rss   # Discourse；偶有对照实测帖（如六次受控 token 测试），API 噪声靠关键词过滤
+    tier: community
     enabled: true
 
   # ---- 编程模型独立量尺与本地生态 ----
