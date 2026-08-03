@@ -20,3 +20,6 @@ config/claims.yaml
 config/accounts.yaml
 # 账号级降智探针（任务集私藏，防针对性训练）
 probes/
+
+# Claude Code 本地权限配置（定时会话预批），不入公开库
+.claude/
