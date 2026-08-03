@@ -440,7 +440,7 @@ def main():
     lines += candidates_section(ledger, authors_today)
     lines.append("")
     lines.append(f"*生成于 {datetime.now(timezone.utc).isoformat(timespec='seconds')}，"
-                 f"遵守 CLAUDE.md 三条写作纪律；厂商口径/独立实测/聚合指数分开标注。*")
+                 f"遵守 AGENTS.md 三条写作纪律；厂商口径/独立实测/聚合指数分开标注。*")
 
     out = ROOT / "briefs" / f"{args.date}.md"
     out.parent.mkdir(exist_ok=True)

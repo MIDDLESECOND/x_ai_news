@@ -33,7 +33,7 @@ Register-ScheduledTask -TaskName "FrontierRadar-L1" -Action $action, $action2 -T
 - **分层证据标注**：厂商口径 / 社区一手 / 聚合 / 聚合指数 / 财经，简报里逐条标明，不混写。
 - **悬案账本**（私有 `config/claims.yaml`）：每个未决论断记录证据与状态（open / leaning-yes / leaning-no / resolved），日报自动对照当日条目提示疑似新信号，把一次性调查变成累积性研究。
 - **信源发现**：不锁死在固定账号清单。聚合信源的引文作者自动累计（`data/candidates_ledger.json`，私有），达到阈值后提名、人工确认晋升。
-- **三条写作纪律**（见 [CLAUDE.md](CLAUDE.md)）：归因检查、警惕整齐结构、正确优先于连贯。
+- **三条写作纪律**（见 [AGENTS.md](AGENTS.md)）：归因检查、警惕整齐结构、正确优先于连贯。
 
 ## 已知信源状态（2026-08-01 验证）
 
