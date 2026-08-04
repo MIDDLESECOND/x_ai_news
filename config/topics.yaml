@@ -82,6 +82,54 @@ topics:
       - CodexRadar   # 降智雷达条目
       - 账号探针     # 自托管订阅端点探针条目
 
+  # 下面两组服务于「研究工业化与岗位边界」悬案组（formal-research-industrialization /
+  # deployment-task-automation / fde-sa-net-jobs）。两组都归「一线实测」而不新开栏目：
+  # classify() 的证据分层守卫会把 official/index 层条目自动改判到「今日发布」，
+  # 于是社区实践帖留在实测栏、厂商公告进发布栏，无需改动 SECTION_ORDER。
+  formal_research:    # → 简报「一线实测」（形式化推理与形式验证）
+    section: 一线实测
+    keywords:
+      # 不可用裸词 Lean：关键词按 IGNORECASE 匹配，会命中英文动词/形容词 lean
+      # （2026-08-04 实测误报："I had to lean back on Opus" 被判为形式化推理信号）。
+      - Lean 4
+      - Lean4
+      - mathlib
+      - theorem prover
+      - proof assistant
+      - formal verification
+      - formalization
+      - formalize
+      - verifier
+      - Erdős
+      - Erdos
+      - conjecture
+      - 形式化
+      - 定理证明
+      - 自动证明
+
+  deployment_labor:   # → 简报「一线实测」（agent 基建 / 企业部署 / 评测可靠性 / 岗位边界证据）
+    section: 一线实测
+    keywords:
+      - forward deployed
+      - deployment engineer
+      - solutions architect
+      - enterprise deployment
+      - agent infrastructure
+      - coding agent
+      # 裸词 evaluation / reliability 过宽（实测 raw 层命中 145 条），且会靠得分
+      # 把论文类条目从「今日发布」抢进「一线实测」——一律收成多词形态。
+      # 不收 'eval harness'/'eval suite'/'production eval'：field_test 的裸词 eval
+      # 按词边界已经命中它们（eval 后跟空格即成立），写在这里纯属重复计分。
+      - evaluation harness
+      - failure mode
+      - headcount
+      - layoff
+      - entry-level
+      - labor market
+      - 裁员
+      - 岗位
+      - 招聘
+
   company:            # 公司/市场动态（悬案匹配另由 claims_section 按监视词交叉比对）
     section: 公司动态
     keywords:

@@ -2,6 +2,8 @@
 # type: rss | hn_algolia | hf_models | hf_papers | github_repos | reddit_rss | html_stub
 # tier: aggregator（聚合）| community（社区一手）| official（厂商口径）| index（聚合指数）| finance（财经）
 # enabled: false 的条目跳过（Phase 2 再补）。
+# 限流相关：delay_before 是抓该信源之前的等待秒数（同域信源之间，如 Reddit）；
+# query_delay 是按关键词收敛的信源（hn_algolia / github_search）各检索词之间的等待秒数，默认 1。
 
 sources:
   # ---- 最高杠杆：AINews（每日机扫 544 个 X 账号 + 12 个 subreddit，带原推链接）----
@@ -30,6 +32,10 @@ sources:
     queries_from: model_keywords   # 检索词取 topics.yaml 的 model_keywords，模型清单只维护一处
     queries_extra:                 # 额外补充词（每个 query 一次请求，points 过滤噪音）
       - OpenAI GPT
+      # 2026-08-03 新增两词：HN 是本管线唯一在抓取阶段就按关键词收敛的信源，
+      # 不补词则「研究工业化与岗位边界」悬案组在此信源上永远零召回。只加两词，即两次额外请求。
+      - formal verification
+      - forward deployed engineer
     min_points: 30
     enabled: true
 

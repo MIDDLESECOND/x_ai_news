@@ -132,16 +132,38 @@ def fetch_rss(src):
     return items
 
 
+def iter_query_json(src, build_url, accept=None):
+    """按检索词逐个请求并解析 JSON —— 两个「抓取阶段就按关键词收敛」的信源共用此形状。
+
+    两条纪律：①词间留间隔，无间隔连打十余次会撞限流（Algolia 无鉴权、GitHub 搜索
+    未鉴权仅 10 次/分）；②单个检索词失败只跳过该词。http_get 对 429 只退避重试一次，
+    再失败就抛；解析失败（限流页/挑战页返回 200 但正文非 JSON）同样会抛。
+    过去这两种异常都会穿出整个 fetcher，让当天该信源的全部检索词一起归零。
+    """
+    delay = src.get("query_delay", 1)
+    for i, q in enumerate(src.get("queries", [])):
+        if i:
+            time.sleep(delay)
+        try:
+            # .json() 必须在 try 内：requests 的 JSONDecodeError 同时继承 ValueError
+            yield q, http_get(build_url(q), accept=accept).json()
+        except (requests.RequestException, ValueError) as e:
+            print(f"[warn] {src.get('id', '?')} 检索词 {q!r} 失败"
+                  f"（{type(e).__name__}），跳过该词", flush=True)
+            continue
+
+
 def fetch_hn(src):
     since = int((datetime.now(timezone.utc) - timedelta(days=2)).timestamp())
     min_points = src.get("min_points", 30)
     seen, items = set(), []
-    for q in src.get("queries", []):
-        resp = http_get(
-            f"{src['url']}?query={requests.utils.quote(q)}&tags=story"
-            f"&numericFilters=points>={min_points},created_at_i>{since}&hitsPerPage=20"
-        )
-        for hit in resp.json().get("hits", []):
+
+    def url(q):
+        return (f"{src['url']}?query={requests.utils.quote(q)}&tags=story"
+                f"&numericFilters=points>={min_points},created_at_i>{since}&hitsPerPage=20")
+
+    for q, data in iter_query_json(src, url):
+        for hit in data.get("hits", []):
             oid = hit.get("objectID")
             if oid in seen:
                 continue
@@ -248,11 +270,13 @@ def fetch_github_search(src):
     since = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
     reported = load_state("gh_audit_seen")  # 每个仓库只报第一次发现，不连报 14 天
     seen, items = set(), []
-    for q in src.get("queries", []):
-        query = requests.utils.quote(f"{q} created:>={since}")
-        resp = http_get(f"{src['url']}?q={query}&sort=updated&per_page=5",
-                        accept="application/vnd.github+json")
-        for r in resp.json().get("items", []):
+
+    def url(q):
+        return (f"{src['url']}?q={requests.utils.quote(f'{q} created:>={since}')}"
+                f"&sort=updated&per_page=5")
+
+    for q, data in iter_query_json(src, url, accept="application/vnd.github+json"):
+        for r in data.get("items", []):
             if r["full_name"] in seen or r["full_name"] in reported:
                 continue
             seen.add(r["full_name"])

@@ -16,11 +16,12 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from brief_marker import brief_synthesized  # 只依赖标准库，不会拖进 yaml/requests
+
 ROOT = Path(__file__).resolve().parent.parent
 LOCK = ROOT / "data" / "state" / "orchestrator.lock"
 LOG = ROOT / "data" / "state" / "orchestrator_log.jsonl"
 SKILL = Path.home() / ".claude" / "scheduled-tasks" / "daily-brief-synthesis" / "SKILL.md"
-SYNTH_MARKER = "人工合成"          # 合成版日报开头引语行必须含此字样
 SYNTH_FALLBACK_AFTER = (9, 45)     # 当天此时刻后日报仍为机械版才兜底
 
 if sys.stdout:
@@ -40,13 +41,6 @@ def run(cmd, timeout):
     return subprocess.run(cmd, cwd=ROOT, timeout=timeout, capture_output=True,
                           text=True, encoding="utf-8", errors="replace",
                           stdin=subprocess.DEVNULL)
-
-
-def brief_synthesized(brief):
-    if not brief.exists():
-        return False
-    head = brief.read_text(encoding="utf-8", errors="replace")[:500]
-    return SYNTH_MARKER in head
 
 
 def main():

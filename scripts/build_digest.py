@@ -20,12 +20,14 @@ import argparse
 import email.utils
 import json
 import re
+import shutil
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
 
+from brief_marker import SYNTH_MARKER, brief_synthesized  # 与 daily_orchestrator 共用同一实现
 from fetch_l1 import X_RESERVED_PATHS  # 与挖掘层共用保留路径清单
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -36,6 +38,13 @@ TIER_LABEL = {
 SECTION_ORDER = ["今日发布", "一线实测", "定价与额度变动", "降智观察", "公司动态"]
 # 与 fetch_l1 序列化的 x.com/<handle>/status/<id> 形式对应（handle 规则与 X_LINK_RE 一致）
 X_STATUS_RE = re.compile(r"x\.com/([A-Za-z0-9_]{1,15})/status/\d+")
+# evidence.link 的首段要被当作主机名，必须满足：纯 ASCII 域名字符 + 字母结尾的 TLD（可带端口）。
+# 这同时排除了 Windows 盘符路径（含反斜杠与冒号）与 'data'、'reports' 这类相对路径首段。
+_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}(?::\d{1,5})?$")
+# 但"像域名的裸文件名"必须排除：note.md / calibration.json 完全符合上面的形状
+# （.md 甚至真的是摩尔多瓦的 TLD），单从语法无法与 linux.do 区分，只能按扩展名兜。
+_FILE_EXT_RE = re.compile(r"\.(md|json|ya?ml|txt|csv|tsv|py|log|bak|pdf|docx?|xlsx?|png|jpe?g)$",
+                          re.IGNORECASE)
 
 if sys.stdout:  # pythonw / stdout 分离的无控制台运行下 sys.stdout 为 None
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -161,6 +170,9 @@ def classify(payloads, topics_cfg, day, window_days):
                 "tier_label": TIER_LABEL.get(p["tier"], p["tier"]),
                 "published": it.get("published", ""),
                 "summary": (it.get("summary") or "")[:300],
+                # 悬案监视词要匹配全文而非截断后的 summary：关键词落在 300 字之后
+                # 就永远不会被发现，而这条截断本是为了压缩简报与 LLM 载荷、并非为了匹配。
+                "match_text": text,
                 "model_hits": model_hits,
                 "topic_hits": sorted({h for _, (_, _, hs) in topic_scores.items() for h in hs}),
                 "injection_warning": p.get("injection_warning", False),
@@ -258,11 +270,18 @@ def _linkify(link):
     link = (link or "").strip()
     if not link:
         return None
-    if link.startswith("http"):
+    if link.lower().startswith(("http://", "https://")):
         return link
-    if "." in link and "/" in link and " " not in link:
-        return "https://" + link
-    return None
+    if " " in link:
+        return None
+    # 首段必须真的像主机名，两个方向都要挡住：
+    #   假阳性——'data/state/x.json'、'D:\...\x.md' 不得被伪造成 https 链接（点不开的
+    #            链接冒充出处，比没有链接更糟）；
+    #   假阴性——'codexradar.com' 这类裸域名是真实可达的具名出处，丢掉等于漏引。
+    host = link.split("/", 1)[0]
+    if not _HOST_RE.match(host) or _FILE_EXT_RE.search(host):
+        return None
+    return "https://" + link
 
 
 def claims_section(claims, all_hits, topics_cfg):
@@ -279,7 +298,8 @@ def claims_section(claims, all_hits, topics_cfg):
         claim_kw = c.get("watch_keywords") or [k for k in probe_kw
                                                if k.lower() in claim_text.lower()]
         related = [it for it in all_hits
-                   if claim_kw and match_keywords(f"{it['title']} {it['summary']}", claim_kw)]
+                   if claim_kw and match_keywords(
+                       it.get("match_text") or f"{it['title']} {it['summary']}", claim_kw)]
         status = c.get("status", "open")
         lines.append(f"- **{c['id']}**（{status}）：{claim_text}")
         lines.append(f"  - 观察点：{c.get('watch', '—')}")
@@ -404,7 +424,29 @@ def main():
     ap.add_argument("--date", default=date.today().isoformat())
     ap.add_argument("--llm", action="store_true", help="调 Claude API 写摘要正文")
     ap.add_argument("--window", type=int, default=3, help="只收录最近 N 天的条目（默认 3）")
+    ap.add_argument("--force", action="store_true",
+                    help="允许覆盖已存在的人工合成版日报（默认拒绝）")
     args = ap.parse_args()
+
+    # --date 直接参与输出路径拼接：不校验则 '2026-8-4' 这类笔误会静默产出一份
+    # 编排器永远找不到的错名日报，'../..' 更会写到 briefs/ 之外。
+    try:
+        # 顺带归一化：fromisoformat 在 3.11+ 也收 '20260804'/'2026-W32-1'，
+        # 不回写就会拿这些形态去拼 data/raw 与 briefs 的路径，产出编排器找不到的错名文件。
+        args.date = date.fromisoformat(args.date).isoformat()
+    except ValueError:
+        sys.exit(f"--date 必须是 YYYY-MM-DD，收到：{args.date!r}")
+
+    # 防覆盖守卫放在一切工作之前：合成版被覆盖即永久丢失（briefs/ 不入库），
+    # 且 --llm 路径下重跑还会白白花掉一次 API 调用。
+    # 拒绝要趁早（省掉 --llm 的一次 API 调用），但备份要等到确定真会写盘那一刻——
+    # 否则对 raw 已被清理的旧日期跑 --force，会先打印"已备份"再报错退出，
+    # 留下残件和一句与事实不符的成功消息。
+    out = ROOT / "briefs" / f"{args.date}.md"
+    overwriting_synth = brief_synthesized(out)
+    if overwriting_synth and not args.force:
+        sys.exit(f"{out} 已是人工合成版，拒绝覆盖。\n"
+                 f"  原始数据仍在 data/raw/{args.date}，确需重建机械版请加 --force。")
 
     topics_cfg = load_yaml("topics.yaml")
     claims_cfg = load_yaml("claims.yaml")
@@ -426,6 +468,11 @@ def main():
 
     body = llm_body(sectioned, claims, args.date) if args.llm else None
     if body:
+        # 打上合成标记：--llm 产出的正文同样是合成版，不打标记会造成两个坏后果——
+        # 防覆盖守卫不认它（下次机械重建直接抹掉），编排器也会当它是机械版再合成一遍。
+        # 括号里注明是 API 还是会话，两者都受保护但可区分。
+        lines.append(f"> 本期正文为{SYNTH_MARKER}（Claude API），机械链接列表见附录。")
+        lines.append("")
         lines += body + ["", "---", ""]
         lines.append("## 附录：当日全部命中条目（机械聚合，逐条带原始链接）")
         lines.append("")
@@ -442,8 +489,14 @@ def main():
     lines.append(f"*生成于 {datetime.now(timezone.utc).isoformat(timespec='seconds')}，"
                  f"遵守 AGENTS.md 三条写作纪律；厂商口径/独立实测/聚合指数分开标注。*")
 
-    out = ROOT / "briefs" / f"{args.date}.md"
     out.parent.mkdir(exist_ok=True)
+    if overwriting_synth:
+        # --force 不允许静默销毁：写盘前留一份字节级拷贝。
+        # 放 data/state 而非 briefs——briefs 被 backup_private 整目录镜像且从不删除。
+        backup = ROOT / "data" / "state" / "brief_backups" / f"{args.date}.synth.bak"
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(out, backup)
+        print(f"[force] 原合成版已备份至 {backup.relative_to(ROOT)}")
     out.write_text("\n".join(lines), encoding="utf-8")
     print(f"简报已写入 {out}（{len(all_hits)} 条命中）")
 
