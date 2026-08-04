@@ -1,0 +1,39 @@
+# 违规样本 —— 纪律检查的阴性对照。
+# 三条悬案各违反一条纪律。测试断言每条都被抓到：一个从不失败的检查等于没有检查。
+
+claims:
+  # 违反纪律 1：挂了 leaning-yes，但全部证据都指不回可点出处。
+  # 这正是 2026-08-04 早上 formal-research-industrialization 的真实状态。
+  - id: violates-committed-without-source
+    claim: "无外部出处却下了倾向判断"
+    status: leaning-yes
+    opened: 2026-08-04
+    evidence:
+      - {src: "本地综述", type: report, verdict: "转述", link: 'D:\local\memo.md', date: 2026-08-04}
+      - {src: "另一份本地文件", type: report, verdict: "转述", link: "data/state/x.json", date: 2026-08-04}
+    watch: "样本"
+
+  # 违反职业含义纪律 2：挂了 ledger_ref 却没有 career_implication。
+  - id: violates-missing-career-tags
+    claim: "与职业战略挂钩却没有三选一标注"
+    status: open
+    opened: 2026-08-04
+    ledger_ref: C-SAMPLE-003
+    evidence:
+      - {src: "可点出处", type: vendor, verdict: "外部可核验", link: "example.com/x", date: 2026-08-04}
+    watch: "样本"
+
+  # 违反职业含义纪律 4：open 悬案却给出了求职硬门槛式建议。
+  - id: violates-hard-gate-on-open-claim
+    claim: "未决悬案被当成硬门槛"
+    status: open
+    opened: 2026-08-04
+    ledger_ref: C-SAMPLE-004
+    evidence:
+      - {src: "可点出处", type: vendor, verdict: "外部可核验", link: "example.com/y", date: 2026-08-04}
+    watch: "样本"
+    career_implication:
+      - "inference：证据不足"
+      # 先写一句合法的禁止性说明，再给出真正的违规建议——
+      # 用于验证检查不会只看第一处匹配就放行。
+      - "personal action：不得出现「不投某类岗位」这种说法；但这里偏偏建议不投 FDE 岗位"

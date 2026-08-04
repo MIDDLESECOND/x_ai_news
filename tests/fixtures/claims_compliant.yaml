@@ -1,0 +1,32 @@
+# 合规样本 —— 纪律检查的阳性对照。
+# 真正的账本 config/claims.yaml 是私有文件，公开仓库里没有它；没有这份样本，
+# 纪律测试在别人的克隆上会整体跳过，等于三条规则只在维护者本机被执行过。
+
+claims:
+  - id: sample-committed-with-source
+    claim: "有可点出处支撑的悬案可以挂 leaning-yes"
+    status: leaning-yes
+    opened: 2026-08-04
+    ledger_ref: C-SAMPLE-001
+    evidence:
+      - {src: "本地记录（不可点）", type: report, verdict: "转述，无外部出处", link: 'D:\local\note.md', date: 2026-08-04}
+      - {src: "可点一手出处", type: vendor, verdict: "外部可核验", link: "example.com/artifact", date: 2026-08-04}
+    watch: "样本：升级与降级条件写在这里"
+    career_implication:
+      - "confirmed fact：有可点出处的既成事实"
+      - "inference：由上述事实推出的判断"
+      - "personal action：个人行动建议"
+    watch_keywords: ["sample"]
+
+  - id: sample-open-no-source
+    claim: "未决悬案允许没有可点出处"
+    status: open
+    opened: 2026-08-04
+    ledger_ref: C-SAMPLE-002
+    evidence:
+      - {src: "仅本地转述", type: report, verdict: "待补出处", link: 'D:\local\note.md', date: 2026-08-04}
+    watch: "本条为 open，按纪律不得转为求职硬门槛；此处刻意写出「不投」二字并紧邻「不得」，用于验证禁止性说明不被误判"
+    career_implication:
+      - "inference：证据不足以下判断"
+      - "personal action：继续观察，不改变现有行动"
+    watch_keywords: ["sample"]
