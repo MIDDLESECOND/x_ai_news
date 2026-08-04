@@ -44,7 +44,8 @@ class LinkifyTest(unittest.TestCase):
             self.assertIsNone(_linkify(p), f"{p} 不应被当作 URL")
 
     def test_windows_paths_are_rejected(self):
-        self.assertIsNone(_linkify(r"D:\Github\learning_path\decisions\D.md"))
+        # 用中性路径：公开层不留任何私有仓库/目录结构的痕迹（守则「私人职业信息只进私有层」）
+        self.assertIsNone(_linkify(r"C:\Users\someone\notes\memo.md"))
 
     def test_prose_and_empty_are_rejected(self):
         for s in ("", "   ", "arxiv 2606.19348", "财联社 2026-07 中下旬", "AlphaSignalAI",
