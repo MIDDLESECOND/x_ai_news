@@ -2,7 +2,7 @@
 """L1 全自动抓取：读 config/sources.yaml，逐个信源拉取并归一化，落盘 data/raw/YYYY-MM-DD/。
 
 零 X 风险：全部免登录公开端点。单个信源失败只记录日志，不影响其他信源。
-页面快照（html_stub）带跨日内容哈希状态（data/state/html_snapshots.json）——
+页面快照（html_stub）带跨日可见正文哈希与可读性状态（data/state/html_snapshots.json）——
 只有内容变化的快照才会被 build_digest 收入简报。
 data/raw 按日期目录自动保留最近 N 天（--keep-days，默认 45）。
 
@@ -239,27 +239,106 @@ def save_state(name, obj):
     tmp.replace(STATE_DIR / f"{name}.json")
 
 
+def content_excerpt(text, required_patterns, limit=5000):
+    """保留页首语境，并优先收录必要内容模式周围的正文。"""
+    if len(text) <= limit:
+        return text
+    if not required_patterns:
+        return text[:limit]
+
+    matches = sorted(
+        (match.start(), match.end())
+        for pattern in required_patterns
+        for match in re.finditer(pattern, text, re.IGNORECASE)
+    )
+    if not matches:
+        return text[:limit]
+
+    # 价格符号通常跟在套餐/模型名称之后，向前保留更多上下文；相邻价格行合并成一段。
+    intervals = []
+    for start, end in matches:
+        span = (max(0, start - 320), min(len(text), end + 560))
+        if intervals and span[0] <= intervals[-1][1] + 80:
+            intervals[-1] = (intervals[-1][0], max(intervals[-1][1], span[1]))
+        else:
+            intervals.append(span)
+
+    head = text[:600].rstrip()
+    output = head
+    for start, end in intervals:
+        snippet = text[start:end].strip()
+        if not snippet or snippet in output:
+            continue
+        separator = "\n… [必要内容片段] …\n"
+        available = limit - len(output) - len(separator)
+        if available <= 0:
+            break
+        output += separator + snippet[:available]
+        if len(snippet) > available:
+            break
+    return output[:limit]
+
+
 def fetch_html_stub(src):
-    """页面快照 + 跨日哈希比对：内容未变的快照标 changed=false，digest 不收入简报。"""
+    """对稳定的可见正文做跨日比对，并显式标记抓取盲区。
+
+    原始 HTML 包含构建号、脚本与 hydration 数据，直接哈希会把页面骨架变化误报为
+    内容更新。可选的 content_required_patterns 用于确认关键正文确实抓到；不可读状态
+    只在首次发现或恢复时进入简报，不能被表述成价格/发布变化。
+    """
     resp = http_get(src["url"])
     if resp.encoding in (None, "ISO-8859-1"):  # 无 charset 头时 requests 默认 latin-1，中文站会乱码
         resp.encoding = resp.apparent_encoding or "utf-8"
     text = re.sub(r"\s+", " ", strip_tags(SCRIPT_STYLE_RE.sub(" ", resp.text)))
-    sha = hashlib.sha256(resp.content).hexdigest()
+    content_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    response_sha = hashlib.sha256(resp.content).hexdigest()
+    required = src.get("content_required_patterns") or []
+    readable = all(re.search(pattern, text, re.IGNORECASE) for pattern in required)
     state = load_state("html_snapshots")
     prev = state.get(src["id"])
-    changed = prev is None or prev.get("sha") != sha
+    prev_readable = prev.get("readable") if prev else None
+    prev_content_sha = prev.get("content_sha") if prev else None
+    if prev is None:
+        changed = True
+    elif not readable:
+        changed = prev_readable is not False
+    elif prev_readable is False:
+        changed = True
+    elif prev_content_sha is None:
+        # 旧状态只保存原始 HTML 哈希。升级当天静默建立正文基线，避免迁移伪更新。
+        changed = False
+    else:
+        changed = prev_content_sha != content_sha
     now = datetime.now(timezone.utc).isoformat()
-    if changed:
-        state[src["id"]] = {"sha": sha, "last_changed": now}
+    if prev is None or changed or prev_content_sha is None:
+        state[src["id"]] = {
+            "sha": content_sha,  # 兼容仍读取旧字段的本地工具
+            "content_sha": content_sha,
+            "response_sha": response_sha,
+            "readable": readable,
+            "last_changed": now if changed else (prev or {}).get("last_changed", now),
+        }
         save_state("html_snapshots", state)
+    if not readable:
+        title = "[页面不可读] " + src["name"]
+        summary = "抓取正文未命中必要内容模式；本条只表示探针盲区，不表示页面内容发生变化。 " + text
+    elif prev_readable is False:
+        title = "[页面恢复可读] " + src["name"]
+        summary = text
+    else:
+        title = (("[页面有更新] " if changed and prev else "[页面快照] ")
+                 + src["name"])
+        summary = text
+    summary = content_excerpt(summary, required)
     return [{
-        "title": ("[页面有更新] " if changed and prev else "[页面快照] ") + src["name"],
+        "title": title,
         "url": src["url"],
         "published": now if changed else (prev or {}).get("last_changed", now),
-        "summary": text[:5000],
-        "content_sha256": sha,
+        "summary": summary,
+        "content_sha256": content_sha,
+        "response_sha256": response_sha,
         "changed": changed,
+        "readable": readable,
     }]
 
 

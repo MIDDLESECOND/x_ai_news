@@ -8,9 +8,9 @@
 关键词匹配：英文/数字关键词按词边界匹配（GA 不会命中 game），中文按子串。
 证据分层：厂商口径 / 聚合指数 tier 的条目不会归入「一线实测」（三类证据不混写）。
 
-管道 A（引文挖掘）：累计推文作者出现频次到 data/candidates_ledger.json——
+管道 A（引文挖掘）：按唯一推文累计作者出现频次到 data/candidates_ledger.json——
 键统一小写（X 用户名大小写不敏感），与 accounts.yaml 对账（seed 清除、candidates
-既有 score 并入），达到晋升阈值（≥3 次独立出现）的在「新信源候选」栏提名。
+既有 score 与实测标记并入）；只有唯一出现数≥3 且实测特征已确认才提名晋升。
 accounts.yaml 本身不自动改写（保留手写注释；晋升是人工确认动作）。
 
 用法：python scripts/build_digest.py [--date YYYY-MM-DD] [--llm] [--window N]
@@ -40,7 +40,7 @@ TIER_LABEL = {
 }
 SECTION_ORDER = ["今日发布", "一线实测", "定价与额度变动", "降智观察", "公司动态"]
 # 与 fetch_l1 序列化的 x.com/<handle>/status/<id> 形式对应（handle 规则与 X_LINK_RE 一致）
-X_STATUS_RE = re.compile(r"x\.com/([A-Za-z0-9_]{1,15})/status/\d+")
+X_STATUS_RE = re.compile(r"(?:https?://)?x\.com/([A-Za-z0-9_]{1,15})/status/(\d+)")
 # evidence.link 的首段要被当作主机名，必须满足：纯 ASCII 域名字符 + 字母结尾的 TLD（可带端口）。
 # 这同时排除了 Windows 盘符路径（含反斜杠与冒号）与 'data'、'reports' 这类相对路径首段。
 _HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}(?::\d{1,5})?$")
@@ -213,7 +213,10 @@ def active_claims(claims_cfg):
 
 
 def update_candidates_ledger(payloads, accounts_cfg, day):
-    """管道 A：从 x_links 提取推文作者，累计到 ledger（每天每作者最多 +1）。
+    """管道 A：从 x_links 提取作者，按唯一 status id 累计到 ledger。
+
+    旧账本把同一滚动条目跨日重复出现算作多次；迁移时以已保存的唯一示例链接
+    重建自动计数，宁可保守少算，也不把重复抓取冒充独立证据。
     键统一小写；与 accounts.yaml 对账：seed 清除（含历史污染）、candidates 既有 score 并入；
     60 天未再出现的一次性作者剔除；写入为原子替换，损坏文件自动备份重建。"""
     ledger_path = ROOT / "data" / "candidates_ledger.json"
@@ -228,50 +231,102 @@ def update_candidates_ledger(payloads, accounts_cfg, day):
 
     seed = {a["handle"].lower() for a in accounts_cfg.get("seed", [])}
 
-    # 键折叠为小写并合并大小写变体（X 用户名大小写不敏感）
+    def status_parts(link):
+        match = X_STATUS_RE.search(str(link or ""))
+        if not match:
+            return None
+        handle, status_id = match.groups()
+        return handle, status_id, f"x.com/{handle}/status/{status_id}"
+
+    def recalculate(entry):
+        entry["status_ids"] = sorted(set(map(str, entry.get("status_ids", []))), key=int)
+        entry["examples"] = list(dict.fromkeys(entry.get("examples", [])))
+        entry["manual_unlinked_count"] = max(0, int(entry.get("manual_unlinked_count", 0)))
+        entry["count"] = entry["manual_unlinked_count"] + len(entry["status_ids"])
+        entry["has_test_signal"] = bool(entry.get("has_test_signal", False))
+
+    # 键折叠为小写并合并大小写变体（X 用户名大小写不敏感）。
+    # legacy count/days 不再作为次数依据，只从保存下来的唯一链接重建。
     folded = {}
     for key, e in ledger.items():
         k = key.lower()
-        tgt = folded.setdefault(k, {"handle": e.get("handle", key), "count": 0,
-                                    "days": [], "examples": []})
+        tgt = folded.setdefault(k, {
+            "handle": e.get("handle", key), "count": 0, "days": [], "examples": [],
+            "status_ids": [], "manual_unlinked_count": 0, "has_test_signal": False,
+        })
         tgt["days"] = sorted(set(tgt["days"]) | set(e.get("days", [])))
-        tgt["count"] = max(len(tgt["days"]), tgt["count"], e.get("count", 0))
+        tgt["status_ids"] = sorted(
+            set(tgt["status_ids"]) | set(map(str, e.get("status_ids", []))), key=int)
+        tgt["manual_unlinked_count"] = max(
+            tgt["manual_unlinked_count"], int(e.get("manual_unlinked_count", 0)))
+        tgt["has_test_signal"] = tgt["has_test_signal"] or bool(e.get("has_test_signal"))
         for ex in e.get("examples", []):
-            if ex not in tgt["examples"] and len(tgt["examples"]) < 5:
+            parts = status_parts(ex)
+            if parts:
+                tgt["status_ids"] = sorted(set(tgt["status_ids"]) | {parts[1]}, key=int)
+            if ex not in tgt["examples"]:
                 tgt["examples"].append(ex)
+        recalculate(tgt)
     ledger = folded
 
     # 对账 1：现役 seed 从账本清除（覆盖 accounts.yaml 曾缺失导致的历史污染）
     ledger = {k: v for k, v in ledger.items() if k not in seed}
 
-    # 对账 2：accounts.yaml candidates（管道 B 产物）的既有 score 作为初始计数并入
+    # 对账 2：accounts.yaml candidates（人工/L2 产物）的既有次数与实测标记并入。
+    # provenance 中能解析出的推文按 status id 去重；没有链接的人工出现保留为基线。
     for cand in accounts_cfg.get("candidates", []):
         k = cand["handle"].lower()
-        if k in seed or k in ledger:
+        if k in seed:
             continue
-        ledger[k] = {"handle": cand["handle"], "count": int(cand.get("score", 1)),
-                     "days": [str(cand.get("first_seen", day))], "examples": []}
+        entry = ledger.setdefault(k, {
+            "handle": cand["handle"], "count": 0, "days": [], "examples": [],
+            "status_ids": [], "manual_unlinked_count": 0, "has_test_signal": False,
+        })
+        provenance = str(cand.get("provenance", ""))
+        provenance_parts = [status_parts(m.group(0)) for m in X_STATUS_RE.finditer(provenance)]
+        provenance_parts = [p for p in provenance_parts if p]
+        provenance_ids = {p[1] for p in provenance_parts}
+        entry["status_ids"] = sorted(set(entry["status_ids"]) | provenance_ids, key=int)
+        for _, _, example in provenance_parts:
+            if example not in entry["examples"]:
+                entry["examples"].append(example)
+        score = max(0, int(cand.get("score", 1)))
+        entry["manual_unlinked_count"] = max(
+            entry.get("manual_unlinked_count", 0), score - len(provenance_ids))
+        entry["has_test_signal"] = (
+            bool(entry.get("has_test_signal")) or bool(cand.get("has_test_signal")))
+        first_seen = str(cand.get("first_seen", day))
+        entry["days"] = sorted(set(entry.get("days", [])) | {first_seen})
+        recalculate(entry)
 
     authors_today = {}
     for p in payloads:
         for it in p["items"]:
             for link in it.get("x_links", []):
-                m = X_STATUS_RE.match(link)
+                m = X_STATUS_RE.search(link)
                 if not m:
                     continue
-                handle = m.group(1)
+                handle, status_id = m.groups()
                 k = handle.lower()
                 if k in seed or k in X_RESERVED_PATHS:
                     continue
-                authors_today.setdefault(k, (handle, link))
+                today_entry = authors_today.setdefault(k, {"handle": handle, "links": {}})
+                today_entry["links"][status_id] = f"x.com/{handle}/status/{status_id}"
 
-    for k, (handle, example) in authors_today.items():
-        e = ledger.setdefault(k, {"handle": handle, "count": 0, "days": [], "examples": []})
-        if day not in e["days"]:
-            e["count"] += 1
-            e["days"] = sorted(set(e["days"]) | {day})[-60:]
-            if example not in e["examples"] and len(e["examples"]) < 5:
+    for k, today_entry in authors_today.items():
+        e = ledger.setdefault(k, {
+            "handle": today_entry["handle"], "count": 0, "days": [], "examples": [],
+            "status_ids": [], "manual_unlinked_count": 0, "has_test_signal": False,
+        })
+        known_ids = set(e.get("status_ids", []))
+        for status_id, example in today_entry["links"].items():
+            if status_id not in known_ids:
+                e["status_ids"].append(status_id)
+                known_ids.add(status_id)
+            if example not in e["examples"]:
                 e["examples"].append(example)
+        e["days"] = sorted(set(e.get("days", [])) | {day})[-60:]
+        recalculate(e)
 
     def stale(e):
         if e.get("count", 0) > 1 or not e.get("days"):
@@ -352,16 +407,28 @@ def claims_section(claims, all_hits, topics_cfg):
 def candidates_section(ledger, authors_today):
     lines = []
     nominees = sorted(
-        ((k, e) for k, e in ledger.items() if e.get("count", 0) >= 3),
+        ((k, e) for k, e in ledger.items()
+         if e.get("count", 0) >= 3 and e.get("has_test_signal") is True),
         key=lambda kv: -kv[1]["count"])
     if nominees:
-        lines.append("**达到晋升阈值（≥3 次独立出现），提名待人工确认升 seed：**")
+        lines.append("**可晋升 seed（≥3 条唯一推文，且实测特征已确认；仍需人工确认）：**")
         for k, e in nominees[:10]:
             example = e["examples"][0] if e.get("examples") else "—"
             lines.append(f"- @{e.get('handle', k)} — 累计 {e['count']} 次；例：{example}")
+    review = sorted(
+        ((k, e) for k, e in ledger.items()
+         if e.get("count", 0) >= 3 and e.get("has_test_signal") is not True),
+        key=lambda kv: -kv[1]["count"])
+    if review:
+        if lines:
+            lines.append("")
+        lines.append("**仅达到频次门槛、未验证实测特征（不能升 seed，待人工复核）：**")
+        for k, e in review[:10]:
+            example = e["examples"][0] if e.get("examples") else "—"
+            lines.append(f"- @{e.get('handle', k)} — {e['count']} 条唯一推文；例：{example}")
     if authors_today:
         lines.append("")
-        display = sorted(h for h, _ in authors_today.values())
+        display = sorted(e["handle"] for e in authors_today.values())
         lines.append(f"今日新增引文作者 {len(authors_today)} 位（入 ledger 累计）：" +
                      "、".join(f"@{h}" for h in display[:20]))
     if not lines:
