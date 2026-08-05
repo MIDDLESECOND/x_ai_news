@@ -11,17 +11,20 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import Counter
 from datetime import date
 from pathlib import Path
 
 import build_digest as bd
-from state_io import atomic_write_if_changed, semantic_hash
+from capture_identity import configured_audit_urls
+from state_io import atomic_write_if_changed, exclusive_lock, semantic_hash
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT = ROOT / "data" / "state" / "current_analysis_context.json"
 DEFAULT_MAX_BYTES = 96 * 1024
 EVIDENCE_TYPES = ("controlled", "n1-user", "vendor", "index", "forum", "report")
 REVERSAL_MARKERS = ("撤回", "改判", "反例", "反证", "削弱", "无法直接裁决", "零直接证据")
+STANCE_ORDER = ("counter", "confounder", "support", "neutral")
 
 
 def _day(value) -> str:
@@ -88,6 +91,8 @@ def related_signals(claim: dict, all_hits: list[dict], topics_cfg: dict) -> list
                 "evidence_label": item.get("tier_label", item.get("tier", "")),
                 "summary": item.get("summary", "")[:300],
                 "injection_warning": bool(item.get("injection_warning")),
+                "source_item_id": item.get("source_item_id", ""),
+                "snapshot_hash": item.get("snapshot_hash", ""),
             })
     return related
 
@@ -105,6 +110,8 @@ def broad_signals(claim: dict, all_hits: list[dict], topics_cfg: dict) -> list[d
                 "url": item.get("url", ""),
                 "source": item.get("source", ""),
                 "source_tier": item.get("tier", ""),
+                "source_item_id": item.get("source_item_id", ""),
+                "snapshot_hash": item.get("snapshot_hash", ""),
                 "reason": "仅实体词命中；需人工确认相关性，不得直接入证据栏",
             })
     return related
@@ -129,13 +136,17 @@ def select_evidence(claim: dict, target_day: str, limit: int = 8) -> list[dict]:
 
     newest = sorted(indexed, key=lambda row: (_day(row[1].get("date")), row[0]), reverse=True)
     target_rows = [row for row in newest if _day(row[1].get("date")) == target_day]
-    reversal_rows = [row for row in newest if any(
-        marker in str(row[1].get("verdict", "")) for marker in REVERSAL_MARKERS)]
+    reversal_rows = [row for row in newest if (
+        row[1].get("stance") in ("counter", "confounder")
+        or any(marker in str(row[1].get("verdict", ""))
+               for marker in REVERSAL_MARKERS))]
     # Reserve anchors before filling the remaining space with today's volume.
     # This prevents a burst of same-day vendor entries from crowding out the
     # ledger's strongest visible counterexample or limitation.
     add(target_rows[:1])
     add(reversal_rows[:1])
+    for stance in STANCE_ORDER:
+        add(row for row in newest if row[1].get("stance") == stance)
     for ev_type in EVIDENCE_TYPES:
         add(row for row in newest if row[1].get("type") == ev_type)
     add(target_rows)
@@ -147,11 +158,15 @@ def select_evidence(claim: dict, target_day: str, limit: int = 8) -> list[dict]:
         "verdict": ev.get("verdict", ""),
         "link": ev.get("link", ""),
         "date": _day(ev.get("date")),
+        "stance": ev.get("stance", "legacy-unspecified"),
+        "source_item_id": ev.get("source_item_id", ""),
+        "snapshot_hash": ev.get("snapshot_hash", ""),
     } for _, ev in selected]
 
 
 def build_context(day: str, claims: list[dict], all_hits: list[dict], topics_cfg: dict,
-                  *, evidence_limit: int = 8, signal_limit: int = 3) -> dict:
+                  *, evidence_limit: int = 8, signal_limit: int = 3,
+                  source_captures: list[dict] | None = None) -> dict:
     active = [c for c in claims if c.get("status") != "resolved"]
     directory = [{
         "id": c.get("id"),
@@ -175,6 +190,9 @@ def build_context(day: str, claims: list[dict], all_hits: list[dict], topics_cfg
                 })
             continue
         chosen = select_evidence(claim, day, evidence_limit)
+        stance_counts = Counter(
+            str(ev.get("stance", "legacy-unspecified"))
+            for ev in (claim.get("evidence") or []))
         details.append({
             "id": claim.get("id"),
             "claim": claim.get("claim", ""),
@@ -182,7 +200,8 @@ def build_context(day: str, claims: list[dict], all_hits: list[dict], topics_cfg
             "watch": claim.get("watch", ""),
             "career_boundary": ("只可记录外部证据并建议复查正典；不得自动生成职业结论、立案或改判"
                                 if "ledger_ref" in claim else None),
-            "evidence_total": len(claim.get("evidence") or []),
+            "evidence_record_total_not_strength": len(claim.get("evidence") or []),
+            "stance_counts": dict(sorted(stance_counts.items())),
             "evidence_selected": chosen,
             "evidence_omitted": max(0, len(claim.get("evidence") or []) - len(chosen)),
             "suspected_signals_total": len(signals),
@@ -204,6 +223,11 @@ def build_context(day: str, claims: list[dict], all_hits: list[dict], topics_cfg
         "active_claim_directory": directory,
         "matched_claim_details": details,
         "broad_claim_candidates": broad_candidates,
+        "source_capture_catalog": source_captures or [],
+        "source_capture_catalog_policy": (
+            "collection identities cover absence/full-list/rollup observations; "
+            "fetched_at/filter state are not snapshot content; collection evidence URL "
+            "must exactly match one configured audit_urls entry"),
         "unmatched_active_claim_count": len(active) - len(details) - len(broad_candidates),
         "matched_claim_count": len(details),
         "broad_candidate_count": len(broad_candidates),
@@ -225,6 +249,14 @@ def enforce_budget(context: dict, max_bytes: int) -> bytes:
     while len(data) > max_bytes and context.get("broad_claim_candidates"):
         removed = context["broad_claim_candidates"].pop()
         context.setdefault("omitted_broad_claim_ids", []).append(removed["id"])
+        context["truncated"] = True
+        data = _json_bytes(context)
+    # Collection identities are useful provenance hints, but must never crowd
+    # matched claim evidence out of the bounded synthesis context.
+    while len(data) > max_bytes and context.get("source_capture_catalog"):
+        removed = context["source_capture_catalog"].pop()
+        context.setdefault("omitted_source_capture_ids", []).append(
+            removed.get("source_item_id", removed.get("source", "unknown")))
         context["truncated"] = True
         data = _json_bytes(context)
     while len(data) > max_bytes and context["matched_claim_details"]:
@@ -265,9 +297,24 @@ def main() -> None:
     topics_cfg = bd.load_yaml("topics.yaml")
     payloads = bd.load_raw(args.date)
     _, all_hits = bd.classify(payloads, topics_cfg, args.date, args.window)
-    context = build_context(args.date, claims_cfg.get("claims", []), all_hits, topics_cfg)
+    source_captures = []
+    audit_urls = configured_audit_urls(ROOT)
+    for payload in payloads:
+        source_item_id, snapshot_hash = bd.source_collection_metadata(payload)
+        source_captures.append({
+            "source": payload.get("source", ""),
+            "tier": payload.get("tier", ""),
+            "item_count": len(payload.get("items") or []),
+            "source_item_id": source_item_id,
+            "snapshot_hash": snapshot_hash,
+            "audit_urls": sorted(audit_urls.get(str(payload.get("source", "")), set())),
+        })
+    context = build_context(args.date, claims_cfg.get("claims", []), all_hits, topics_cfg,
+                            source_captures=source_captures)
     data = enforce_budget(context, args.max_bytes)
-    changed = atomic_write_if_changed(args.output, data)
+    lock = ROOT / "data" / "state" / "locks" / "analysis-context.lock"
+    with exclusive_lock(lock):
+        changed = atomic_write_if_changed(args.output, data)
     print(f"分析上下文{'已更新' if changed else '未变化'}：{args.output} "
           f"({len(data)} bytes, sha256={semantic_hash(data)[:12]})")
 

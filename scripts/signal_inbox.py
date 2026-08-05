@@ -12,8 +12,9 @@ import re
 import sys
 from datetime import date
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from capture_identity import validate_capture_bindings
+from source_urls import canonical_url
 from state_io import atomic_write_if_changed, exclusive_lock, semantic_hash
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -22,26 +23,8 @@ LOCK_ROOT = ROOT / "data" / "state" / "locks"
 SOURCE_TYPES = {"controlled", "n1-user", "vendor", "index", "forum", "report"}
 ACTIONS = {"watch_signal", "claim_candidate"}
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,79}$")
-DROP_QUERY_PREFIXES = ("utm_",)
-DROP_QUERY_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
-
-
-def canonical_url(value: str) -> str:
-    value = (value or "").strip()
-    parts = urlsplit(value)
-    if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
-        raise ValueError("url 必须是可点的 http/https 原始出处")
-    host = parts.hostname.lower()
-    if host.startswith("www."):
-        host = host[4:]
-    netloc = host
-    if parts.port:
-        netloc += f":{parts.port}"
-    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
-             if k.lower() not in DROP_QUERY_KEYS
-             and not any(k.lower().startswith(p) for p in DROP_QUERY_PREFIXES)]
-    path = parts.path.rstrip("/") or "/"
-    return urlunsplit((parts.scheme.lower(), netloc, path, urlencode(sorted(query)), ""))
+SOURCE_ITEM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{2,199}$")
+SNAPSHOT_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _clean_text(name: str, value, limit: int, *, required: bool = True) -> str:
@@ -56,10 +39,10 @@ def _clean_text(name: str, value, limit: int, *, required: bool = True) -> str:
 
 
 def observation_identity(record: dict) -> str:
-    """Identify one observation without collapsing later snapshots of one URL."""
+    """Identify one captured observation independent of analyst rewording."""
     fields = (
-        "date", "title", "source_type", "matched_claim", "candidate_key",
-        "why_it_matters", "main_alternative", "next_check", "action",
+        "source_item_id", "snapshot_hash", "matched_claim", "candidate_key",
+        "action",
     )
     payload = {name: record.get(name) for name in fields}
     payload["url"] = canonical_url(str(record.get("url", "")))
@@ -71,6 +54,7 @@ def validate_record(raw: dict) -> dict:
     allowed = {
         "date", "title", "url", "source_type", "matched_claim", "candidate_key",
         "why_it_matters", "main_alternative", "next_check", "action",
+        "source_item_id", "snapshot_hash",
     }
     unknown = set(raw) - allowed
     if unknown:
@@ -96,9 +80,16 @@ def validate_record(raw: dict) -> dict:
     if action == "watch_signal" and not (matched or candidate):
         raise ValueError("watch_signal 必须指向 matched_claim 或 candidate_key")
 
+    source_item_id = str(raw.get("source_item_id", "")).strip()
+    if not SOURCE_ITEM_ID_RE.fullmatch(source_item_id):
+        raise ValueError("source_item_id 必须绑定一个已抓取的稳定条目身份")
+    snapshot_hash = str(raw.get("snapshot_hash", "")).strip().lower()
+    if not SNAPSHOT_HASH_RE.fullmatch(snapshot_hash):
+        raise ValueError("snapshot_hash 必须是 64 位小写 sha256")
+
     url = canonical_url(str(raw.get("url", "")))
     record = {
-        "version": 1,
+        "version": 2,
         "date": day,
         "title": _clean_text("title", raw.get("title"), 300),
         "url": url,
@@ -109,6 +100,8 @@ def validate_record(raw: dict) -> dict:
         "main_alternative": _clean_text("main_alternative", raw.get("main_alternative"), 1000),
         "next_check": _clean_text("next_check", raw.get("next_check"), 1000),
         "action": action,
+        "source_item_id": source_item_id,
+        "snapshot_hash": snapshot_hash,
     }
     record["id"] = observation_identity(record)[:20]
     return record
@@ -136,6 +129,7 @@ def add_records(root: Path, raw_records: list[dict]) -> tuple[int, int, Path | N
     if not raw_records:
         return 0, 0, None
     records = [validate_record(r) for r in raw_records]
+    validate_capture_bindings(root, records, url_key="url")
     months = {r["date"][:7] for r in records}
     if len(months) != 1:
         raise ValueError("一次写入只能包含同一个月份的记录")

@@ -52,6 +52,8 @@ class MatchTextTest(unittest.TestCase):
 
     def test_match_text_keeps_full_body(self):
         self.assertIn(TAIL_KEYWORD, self.item["match_text"])
+        self.assertRegex(self.item["source_item_id"], r"^[^:]+:[0-9a-f]{20}$")
+        self.assertRegex(self.item["snapshot_hash"], r"^[0-9a-f]{64}$")
 
     def test_claim_watch_keyword_beyond_300_chars_is_found(self):
         """回归：这正是修复前会漏掉的信号。"""
@@ -65,6 +67,33 @@ class MatchTextTest(unittest.TestCase):
         """短摘要下两者应当一致，确保改动没有引入别的行为差异。"""
         _, hits = bd.classify(payload("Claude tested today"), TOPICS, DAY, 3)
         self.assertIn(hits[0]["summary"], hits[0]["match_text"])
+
+    def test_collection_capture_has_separate_identity(self):
+        source_id, snapshot_hash = bd.source_collection_metadata(payload("x")[0])
+        self.assertRegex(source_id, r":collection$")
+        self.assertRegex(snapshot_hash, r"^[0-9a-f]{64}$")
+
+    def test_collection_hash_ignores_fetch_time_but_tracks_content(self):
+        first = payload("x")[0]
+        first["fetched_at"] = "2026-08-05T01:00:00Z"
+        second = dict(first, fetched_at="2026-08-05T02:00:00Z")
+        self.assertEqual(bd.source_collection_metadata(first),
+                         bd.source_collection_metadata(second))
+        state_only = dict(second, items=[dict(
+            second["items"][0], changed=True, matched_query="different")])
+        self.assertEqual(bd.source_collection_metadata(first),
+                         bd.source_collection_metadata(state_only))
+        changed = dict(second, items=second["items"] + [{
+            "title": "new", "url": "https://example.com/new"}])
+        self.assertNotEqual(bd.source_collection_metadata(first)[1],
+                            bd.source_collection_metadata(changed)[1])
+
+    def test_item_identity_uses_canonical_url(self):
+        first = {"title": "same", "url": "https://www.example.com/a/?utm_source=x",
+                 "published": DAY, "summary": "same"}
+        second = dict(first, url="https://example.com/a")
+        self.assertEqual(bd.source_item_metadata("feed", first),
+                         bd.source_item_metadata("feed", second))
 
 
 if __name__ == "__main__":

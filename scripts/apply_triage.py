@@ -18,14 +18,21 @@ from pathlib import Path
 
 import yaml
 
+from capture_identity import validate_capture_bindings
 from signal_inbox import SOURCE_TYPES, canonical_url
 from state_io import atomic_write_if_changed, exclusive_lock, semantic_hash
 
 ROOT = Path(__file__).resolve().parent.parent
 CLAIM_ID_RE = re.compile(r"^  - id:\s*([^\s#]+)")
 WATCH_RE = re.compile(r"^    watch:")
+SOURCE_ITEM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{2,199}$")
+SNAPSHOT_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+EVIDENCE_STANCES = {"support", "counter", "neutral", "confounder"}
 ALLOWED_TOP = {"evidence_additions"}
-ALLOWED_EVIDENCE = {"claim_id", "src", "type", "verdict", "link", "date"}
+ALLOWED_EVIDENCE = {
+    "claim_id", "src", "type", "verdict", "link", "date", "stance",
+    "source_item_id", "snapshot_hash",
+}
 
 
 def validate_addition(raw: dict) -> dict:
@@ -44,13 +51,24 @@ def validate_addition(raw: dict) -> dict:
         raise ValueError("verdict 不能为空且不得超过 3000 字符")
     if ev_type not in SOURCE_TYPES:
         raise ValueError(f"type 必须是：{', '.join(sorted(SOURCE_TYPES))}")
+    stance = str(raw.get("stance", "")).strip()
+    if stance not in EVIDENCE_STANCES:
+        raise ValueError(f"stance 必须是：{', '.join(sorted(EVIDENCE_STANCES))}")
+    source_item_id = str(raw.get("source_item_id", "")).strip()
+    if not SOURCE_ITEM_ID_RE.fullmatch(source_item_id):
+        raise ValueError("source_item_id 必须绑定一个已抓取的稳定条目身份")
+    snapshot_hash = str(raw.get("snapshot_hash", "")).strip().lower()
+    if not SNAPSHOT_HASH_RE.fullmatch(snapshot_hash):
+        raise ValueError("snapshot_hash 必须是 64 位小写 sha256")
     try:
         day = date.fromisoformat(str(raw.get("date"))).isoformat()
     except ValueError as exc:
         raise ValueError("date 必须是 YYYY-MM-DD") from exc
     link = canonical_url(str(raw.get("link", "")))
     return {"claim_id": claim_id, "src": src, "type": ev_type,
-            "verdict": verdict, "link": link, "date": day}
+            "verdict": verdict, "link": link, "date": day,
+            "stance": stance, "source_item_id": source_item_id,
+            "snapshot_hash": snapshot_hash}
 
 
 def validate_proposal(raw: dict) -> list[dict]:
@@ -79,7 +97,7 @@ def _claim_ranges(lines: list[str]) -> dict[str, tuple[int, int]]:
     return ranges
 
 
-def _evidence_identity(evidence: dict) -> str:
+def _legacy_evidence_identity(evidence: dict) -> str:
     raw_day = evidence.get("date", "")
     day = raw_day.isoformat() if hasattr(raw_day, "isoformat") else str(raw_day).strip()
     payload = {
@@ -93,13 +111,30 @@ def _evidence_identity(evidence: dict) -> str:
                                     separators=(",", ":")))
 
 
+def _evidence_identities(evidence: dict) -> set[str]:
+    source_item_id = str(evidence.get("source_item_id", "")).strip()
+    snapshot_hash = str(evidence.get("snapshot_hash", "")).strip().lower()
+    identities = set()
+    if source_item_id and SNAPSHOT_HASH_RE.fullmatch(snapshot_hash):
+        # One captured source snapshot is one evidence observation.  Rewording
+        # its verdict or changing stance must not manufacture another record.
+        payload = {"source_item_id": source_item_id,
+                   "snapshot_hash": snapshot_hash}
+        identities.add(semantic_hash(json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))))
+    # Keep the legacy identity as a migration bridge.  It prevents the first
+    # captured version of an already-recorded row from duplicating that row.
+    identities.add(_legacy_evidence_identity(evidence))
+    return identities
+
+
 def _existing_evidence_ids(claims: list[dict]) -> dict[str, set[str]]:
     result = {}
     for claim in claims:
         identities = set()
         for ev in claim.get("evidence") or []:
             try:
-                identities.add(_evidence_identity(ev))
+                identities.update(_evidence_identities(ev))
             except ValueError:
                 pass
         result[str(claim.get("id"))] = identities
@@ -122,13 +157,16 @@ def apply_additions_text(original: str, additions: list[dict]) -> tuple[str, int
         claim_id = addition["claim_id"]
         if claim_id not in by_id:
             raise ValueError(f"账本中不存在 claim：{claim_id}")
-        identity = _evidence_identity(addition)
-        if (identity in existing.get(claim_id, set())
-                or identity in seen_batch[claim_id]):
+        if "ledger_ref" in by_id[claim_id]:
+            raise ValueError(
+                f"职业正典关联悬案禁止自动写入：{claim_id}；请写候选箱并建议人工复查正典")
+        identities = _evidence_identities(addition)
+        if (identities & existing.get(claim_id, set())
+                or identities & seen_batch[claim_id]):
             duplicates += 1
             continue
         accepted.append(addition)
-        seen_batch[claim_id].add(identity)
+        seen_batch[claim_id].update(identities)
     if not accepted:
         return original, 0, duplicates
 
@@ -148,7 +186,9 @@ def apply_additions_text(original: str, additions: list[dict]) -> tuple[str, int
             raise ValueError(f"claim {claim_id} 缺少 watch 字段，拒绝猜测插入位置")
         rendered = []
         for record in records:
-            payload = {k: record[k] for k in ("src", "type", "verdict", "link", "date")}
+            payload = {k: record[k] for k in (
+                "src", "type", "stance", "verdict", "link", "date",
+                "source_item_id", "snapshot_hash")}
             rendered.append("      - " + json.dumps(payload, ensure_ascii=False,
                                                        separators=(", ", ": ")) + newline)
         insertions.append((watch_idx, rendered))
@@ -168,6 +208,7 @@ def apply_additions_text(original: str, additions: list[dict]) -> tuple[str, int
 
 def apply_proposal(root: Path, proposal: dict, *, run_tests: bool = False) -> tuple[int, int]:
     additions = validate_proposal(proposal)
+    validate_capture_bindings(root, additions, url_key="link")
     claims_path = root / "config" / "claims.yaml"
     lock = root / "data" / "state" / "locks" / "claims-writer.lock"
     with exclusive_lock(lock):

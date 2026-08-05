@@ -66,6 +66,7 @@ sources:
     name: HF Z.ai org 最新权重
     type: hf_models
     url: "https://huggingface.co/api/models?author=zai-org&sort=lastModified&direction=-1&limit=10"
+    audit_urls: [https://huggingface.co/zai-org]
     tier: official
     enabled: true
 
@@ -201,6 +202,7 @@ sources:
     name: CodexRadar
     type: codexradar
     url: https://codexradar.com/data/intelligence-efficiency.json
+    audit_urls: [https://codexradar.com/]
     tier: radar
     iq_delta_threshold: 2.0   # 单档 IQ 变动超此值才单独报告
     summary_models:           # 每日快照里点名的模型
@@ -275,6 +277,7 @@ sources:
     name: HF Qwen org 最新权重
     type: hf_models
     url: "https://huggingface.co/api/models?author=Qwen&sort=lastModified&direction=-1&limit=10"
+    audit_urls: [https://huggingface.co/Qwen]
     tier: official
     enabled: true
 

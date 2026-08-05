@@ -37,3 +37,20 @@ claims:
       # 先写一句合法的禁止性说明，再给出真正的违规建议——
       # 用于验证检查不会只看第一处匹配就放行。
       - "personal action：不得出现「不投某类岗位」这种说法；但这里偏偏建议不投 FDE 岗位"
+
+  # 违反自动证据身份规则：一旦出现新 schema 字段，就必须 stance/id/hash 三者齐全。
+  - id: violates-incomplete-capture-identity
+    claim: "自动证据只写了部分抓取身份"
+    status: open
+    opened: 2026-08-05
+    evidence:
+      - {src: "样本", type: vendor, stance: support, verdict: "缺少快照身份", link: "https://example.com/z", date: 2026-08-05}
+    watch: "样本"
+
+  - id: violates-new-record-disguised-as-legacy
+    claim: "新证据省略全部身份字段"
+    status: open
+    opened: 2026-08-05
+    evidence:
+      - {src: "样本", type: vendor, verdict: "不能继续当 legacy", link: "https://example.com/new", date: 2026-08-05}
+    watch: "样本"

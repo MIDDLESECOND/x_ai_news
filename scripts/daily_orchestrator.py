@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""开机即查的日常总调度：探针 → 机械日报 → 有界上下文 → 合成 → dossier → 备份。
+"""开机即查的日常总调度：探针 → 机械日报 → 有界上下文 → 合成 → finalize。
 
 设计：幂等 + 有序。每个环节先查当天是否已完成，未完成才跑；全齐则秒退。
 触发（Windows 任务）：FrontierRadar-Daily 每天 09:00（WakeToRun）+ 每次登录；
@@ -57,7 +57,7 @@ def build_context(day):
 
 
 def run_synthesis(day, brief, context_result):
-    """Run only the bounded synthesis step; never back up or push."""
+    """Run bounded synthesis; return True when finalized under its lease."""
     h, m = SYNTH_FALLBACK_AFTER
     current = datetime.now()  # 前面的探针可能跑很久，不能继续用进程启动时刻判断
     past_cutoff = (current.hour, current.minute) >= (h, m)
@@ -100,12 +100,43 @@ def run_synthesis(day, brief, context_result):
                      "Bash(python scripts/signal_inbox.py add --input data/state/pending_inbox.json)",
                      "Bash(python scripts/apply_triage.py --input data/state/pending_evidence.json)",
                      "Bash(python scripts/build_report_dossiers.py)",
+                     "Bash(python scripts/finalize_daily.py *)",
                      "--disallowedTools", "PowerShell", "WebFetch", "WebSearch"],
                     timeout=2400, env=synthesis_env)
                 log("synthesis", "ok" if brief_synthesized(brief) else "兜底后仍非合成版",
                     (synthesis_result.stdout or "").strip()[-200:])
+                # The lease covers the whole fallback transaction, including
+                # triage-derived views and the final backup.  Releasing it
+                # between synthesis and finalization would reopen the App race.
+                run_finalization(day, brief, lease_held=True)
+                return True
             finally:
                 release_lease(ROOT, day, "orchestrator")
+    return False
+
+
+def run_finalization(day, brief, *, lease_held=False):
+    """Finalize only a synthesized brief; never back up a provisional snapshot."""
+    if not brief_synthesized(brief):
+        log("finalize", "skip", "日报仍是机械版，不创建误导性的最终备份")
+        return None
+    owner = "orchestrator-finalize"
+    token = True
+    if not lease_held:
+        token = acquire_lease(
+            ROOT, day, owner, stale_after=APP_LEASE_STALE_AFTER)
+        if token is None:
+            log("finalize", "skip", "App 或另一合成器仍持有共享 lease")
+            return None
+    try:
+        result = run([sys.executable, "scripts/finalize_daily.py", "--date", day],
+                     timeout=1200)
+        log("finalize", "ok" if result.returncode == 0 else f"退出码 {result.returncode}",
+            ((result.stdout or "") + (result.stderr or "")).strip()[-300:])
+        return result
+    finally:
+        if not lease_held:
+            release_lease(ROOT, day, owner)
 
 
 def main(*, synthesis_only=False):
@@ -126,7 +157,9 @@ def main(*, synthesis_only=False):
             if not (raw / "_fetch_log.json").exists() or not brief.exists():
                 log("synthesis", "skip", "当日原始数据或机械日报未就绪")
                 return
-            run_synthesis(day, brief, build_context(day))
+            finalized = run_synthesis(day, brief, build_context(day))
+            if not finalized:
+                run_finalization(day, brief)
             return
 
         # 1. 账号探针（每天一次；auth 失败时 run_probe 自身会整臂跳过）
@@ -157,18 +190,11 @@ def main(*, synthesis_only=False):
         context_result = build_context(day)
 
         # 4. 合成兜底（App 定时会话没跑成时才出手）
-        run_synthesis(day, brief, context_result)
+        finalized = run_synthesis(day, brief, context_result)
 
-        # 5. 派生 dossier 非阻塞：失败不得拖垮日报或备份，也不得碰正式专题报告。
-        dossier = run([sys.executable, "scripts/build_report_dossiers.py"], timeout=120)
-        log("dossiers", "ok" if dossier.returncode == 0 else f"退出码 {dossier.returncode}",
-            ((dossier.stdout or "") + (dossier.stderr or "")).strip()[-200:])
-
-        # 6. 私有备份（脚本自身无变更不提交；把当天已产出的东西尽早送出去）
-        backup_result = run([sys.executable, "scripts/backup_private.py"], timeout=900)
-        log("backup", "ok" if backup_result.returncode == 0
-            else f"退出码 {backup_result.returncode}",
-            (backup_result.stdout or "").strip()[-200:])
+        # 5. 统一收尾：dossier → 上一完整月复盘 → 快照指纹 → 私有备份。
+        if not finalized:
+            run_finalization(day, brief)
     finally:
         LOCK.unlink(missing_ok=True)
 

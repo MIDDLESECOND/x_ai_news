@@ -18,6 +18,7 @@ accounts.yaml 本身不自动改写（保留手写注释；晋升是人工确认
 """
 import argparse
 import email.utils
+import hashlib
 import json
 import re
 import shutil
@@ -28,6 +29,8 @@ from pathlib import Path
 import yaml
 
 from brief_marker import SYNTH_MARKER, brief_synthesized  # 与 daily_orchestrator 共用同一实现
+from capture_identity import (source_collection_metadata as _source_collection_metadata,
+                              source_item_metadata as _source_item_metadata)
 from fetch_l1 import X_RESERVED_PATHS  # 与挖掘层共用保留路径清单
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -118,6 +121,22 @@ def parse_pubdate(s):
     return dt
 
 
+def source_item_metadata(source_id, item):
+    """Return a stable source item id and an exact captured-snapshot hash.
+
+    The item id is stable across later fetches of the same source URL.  The
+    snapshot hash changes when the captured title, publication time, summary,
+    or upstream page-content hash changes.  Together they let ledger evidence
+    point back to one captured observation instead of only a prose description.
+    """
+    return _source_item_metadata(source_id, item)
+
+
+def source_collection_metadata(payload):
+    """Identify one complete fetched source collection for absence/rollup claims."""
+    return _source_collection_metadata(payload)
+
+
 def classify(payloads, topics_cfg, day, window_days):
     """返回 (sectioned_items, all_hits)。条目须命中模型词或任一主题词才入围。
     带可解析日期且早于窗口的条目跳过（全历史 feed 由此收敛）；
@@ -163,6 +182,10 @@ def classify(payloads, topics_cfg, day, window_days):
             # 三类证据不混写：厂商口径/聚合指数不得出现在「一线实测」
             if section == "一线实测" and p["tier"] in ("official", "index"):
                 section = "今日发布"
+            source_id = p.get("source") or (
+                "source-" + hashlib.sha256(str(p.get("name", "unknown")).encode("utf-8"))
+                .hexdigest()[:12])
+            source_item_id, snapshot_hash = source_item_metadata(source_id, it)
             item = {
                 "title": it.get("title", "").strip() or url,
                 "url": url,
@@ -176,6 +199,8 @@ def classify(payloads, topics_cfg, day, window_days):
                 "model_hits": model_hits,
                 "topic_hits": sorted({h for _, (_, _, hs) in topic_scores.items() for h in hs}),
                 "injection_warning": p.get("injection_warning", False),
+                "source_item_id": source_item_id,
+                "snapshot_hash": snapshot_hash,
             }
             sectioned[section].append(item)
             all_hits.append(item)
@@ -304,12 +329,19 @@ def claims_section(claims, all_hits, topics_cfg):
         lines.append(f"- **{c['id']}**（{status}）：{claim_text}")
         lines.append(f"  - 观察点：{c.get('watch', '—')}")
         ev_links = []
+        stance_label = {
+            "support": "支持", "counter": "反证/削弱",
+            "confounder": "混杂/替代解释", "neutral": "中立背景",
+            "legacy-unspecified": "旧记录未标注",
+        }
         for ev in c.get("evidence", []):
             url = _linkify(ev.get("link"))
             if url:
-                ev_links.append(f"[{ev.get('src', '来源')}]({url})")
+                stance = ev.get("stance", "legacy-unspecified")
+                ev_links.append(
+                    f"{stance_label.get(stance, stance)}：[{ev.get('src', '来源')}]({url})")
         if ev_links:
-            lines.append(f"  - 证据出处：{'、'.join(ev_links[:4])}")
+            lines.append(f"  - 立场化证据记录（数量不代表支持强度）：{'；'.join(ev_links[:4])}")
         if related:
             lines.append(f"  - 今日疑似新信号 {len(related)} 条（需人工判读后写回 claims.yaml）：")
             for it in related[:3]:

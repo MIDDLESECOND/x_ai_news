@@ -26,6 +26,9 @@ CLAIMS = ROOT / "config" / "claims.yaml"
 LEGAL_TAGS = ("confirmed fact", "inference", "personal action")
 COMMITTED = ("leaning-yes", "leaning-no", "resolved")   # 等于"倾向下判断"的状态
 HARD_GATE_WORDS = ("不投", "不申请", "不要投", "放弃该领域")
+EVIDENCE_STANCES = {"support", "counter", "neutral", "confounder"}
+CAPTURE_SCHEMA_START = "2026-08-05"
+SOURCE_ITEM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{2,199}$")
 # 禁止性说明会把被禁的说法**引起来**（「不投某类岗位」），真正的违规建议不会。
 # 早先用"前 12 个字符内是否出现『不得』"来豁免，那是个凭空定的窗口，句子稍长就误报。
 _QUOTED = re.compile(r"「[^」]*」|『[^』]*』|“[^”]*”|\"[^\"]*\"|'[^']*'")
@@ -81,10 +84,38 @@ def violations_hard_gate_on_open(claims):
     return out
 
 
+def violations_incomplete_capture_identity(claims):
+    out = []
+    required = {"stance", "source_item_id", "snapshot_hash"}
+    for claim in claims:
+        for index, evidence in enumerate(claim.get("evidence") or []):
+            if not (required & set(evidence)):
+                raw_day = evidence.get("date", "")
+                day = raw_day.isoformat() if hasattr(raw_day, "isoformat") else str(raw_day)
+                if day >= CAPTURE_SCHEMA_START:
+                    out.append(
+                        f"{claim['id']} evidence[{index}]: 新记录不得伪装成 legacy")
+                continue  # cutoff 前的 legacy row；不从措辞猜 stance
+            missing = required - set(evidence)
+            if missing:
+                out.append(f"{claim['id']} evidence[{index}]: 抓取身份字段不完整 {sorted(missing)}")
+                continue
+            if evidence.get("stance") not in EVIDENCE_STANCES:
+                out.append(f"{claim['id']} evidence[{index}]: stance 非法")
+            if not re.fullmatch(r"[0-9a-f]{64}", str(evidence.get("snapshot_hash", ""))):
+                out.append(f"{claim['id']} evidence[{index}]: snapshot_hash 非法")
+            if not SOURCE_ITEM_ID_RE.fullmatch(str(evidence.get("source_item_id", ""))):
+                out.append(f"{claim['id']} evidence[{index}]: source_item_id 非法")
+            if not str(evidence.get("link", "")).startswith(("http://", "https://")):
+                out.append(f"{claim['id']} evidence[{index}]: 自动证据必须有单一可点 URL")
+    return out
+
+
 RULES = (
     ("纪律1 可点出处", violations_committed_without_source),
     ("纪律2 三选一标注", violations_missing_career_tags),
     ("纪律4 无硬门槛", violations_hard_gate_on_open),
+    ("自动证据身份完整", violations_incomplete_capture_identity),
 )
 
 
@@ -118,6 +149,11 @@ class ViolatingFixtureTest(unittest.TestCase):
         """回归：违规句排在一句合法的禁止性说明之后，只看第一处匹配会漏掉。"""
         found = violations_hard_gate_on_open(self.claims)
         self.assertTrue(any("violates-hard-gate-on-open-claim" in v for v in found), found)
+
+    def test_catches_incomplete_capture_identity(self):
+        found = violations_incomplete_capture_identity(self.claims)
+        self.assertTrue(any("violates-incomplete-capture-identity" in v for v in found), found)
+        self.assertTrue(any("violates-new-record-disguised-as-legacy" in v for v in found), found)
 
 
 @unittest.skipUnless(CLAIMS.exists(), "config/claims.yaml 是私有文件，公开仓库中不存在")

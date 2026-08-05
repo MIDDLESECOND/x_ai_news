@@ -16,11 +16,18 @@ from urllib.parse import urlsplit
 
 import build_digest as bd
 from signal_inbox import load_month
-from state_io import atomic_write_if_changed
+from state_io import atomic_write_if_changed, exclusive_lock
 
 ROOT = Path(__file__).resolve().parent.parent
 INDEPENDENT_TYPES = {"controlled", "n1-user", "forum", "report"}
 DEFAULT_WINDOW_DAYS = 60
+
+
+def previous_complete_month(as_of: date) -> str:
+    """Return the last fully completed calendar month at *as_of*."""
+    first = as_of.replace(day=1)
+    previous_end = first - timedelta(days=1)
+    return previous_end.strftime("%Y-%m")
 
 
 def domain(url: str) -> str:
@@ -62,7 +69,8 @@ def load_review_window(inbox_root: Path, month: str,
 
 def render_review(month: str, rows: list[dict], claims: list[dict],
                   *, window_start: date | None = None,
-                  window_end: date | None = None) -> str:
+                  window_end: date | None = None,
+                  as_of: date | None = None) -> str:
     by_id = {c.get("id"): c for c in claims}
     matched = defaultdict(list)
     candidates = defaultdict(list)
@@ -77,6 +85,8 @@ def render_review(month: str, rows: list[dict], claims: list[dict],
     lines = [f"# Frontier Radar 悬案月度复盘候选 — {month}", "",
              "> 自动生成的候选视图，不是立案或改判结果。claims.yaml 是唯一权威来源。", "",
              *([window_line] if window_line else []),
+             *([f"- 证据截止（as_of）：{as_of.isoformat()}（不含此后材料）"]
+               if as_of else []),
              f"- 候选箱信号：{len(rows)} 条", f"- 指向现有悬案：{sum(map(len, matched.values()))} 条",
              f"- 新悬案候选：{sum(map(len, candidates.values()))} 条", ""]
 
@@ -96,6 +106,9 @@ def render_review(month: str, rows: list[dict], claims: list[dict],
             lines.append("")
         for row in matched[claim_id]:
             lines.append(f"- [{row['title']}]({row['url']})（{row['date']}；{row['source_type']}）")
+            if row.get("source_item_id"):
+                lines.append(f"  - 抓取身份：`{row['source_item_id']}` / "
+                             f"`{str(row.get('snapshot_hash', ''))[:12]}…`")
             lines.append(f"  - 影响：{row['why_it_matters']}")
             lines.append(f"  - 替代解释：{row['main_alternative']}")
             lines.append(f"  - 下一验证：{row['next_check']}")
@@ -114,6 +127,9 @@ def render_review(month: str, rows: list[dict], claims: list[dict],
                      f"含非厂商/指数材料：{'是' if stats['has_non_vendor_or_index'] else '否'}")
         for row in group:
             lines.append(f"- [{row['title']}]({row['url']})（{row['date']}；{row['source_type']}）")
+            if row.get("source_item_id"):
+                lines.append(f"  - 抓取身份：`{row['source_item_id']}` / "
+                             f"`{str(row.get('snapshot_hash', ''))[:12]}…`")
             lines.append(f"  - 影响：{row['why_it_matters']}")
             lines.append(f"  - 替代解释：{row['main_alternative']}")
             lines.append(f"  - 下一验证：{row['next_check']}")
@@ -128,22 +144,39 @@ def render_review(month: str, rows: list[dict], claims: list[dict],
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--month", required=True, help="YYYY-MM")
+    ap.add_argument("--month", help="YYYY-MM；省略时取 --as-of 的上一个完整月份")
+    ap.add_argument("--as-of", default=date.today().isoformat(),
+                    help="运行边界 YYYY-MM-DD；自动模式据此选择上一个完整月份")
     ap.add_argument("--window-days", type=int, default=DEFAULT_WINDOW_DAYS)
     ap.add_argument("--output", type=Path)
     args = ap.parse_args()
-    if not re.fullmatch(r"\d{4}-\d{2}", args.month):
+    try:
+        as_of = date.fromisoformat(args.as_of)
+    except ValueError as exc:
+        raise SystemExit("--as-of 必须是 YYYY-MM-DD") from exc
+    month = args.month or previous_complete_month(as_of)
+    if not re.fullmatch(r"\d{4}-\d{2}", month):
         raise SystemExit("--month 必须是 YYYY-MM")
+    try:
+        year, month_number = map(int, month.split("-"))
+        date(year, month_number, 1)
+    except ValueError as exc:
+        raise SystemExit("--month 必须是有效的 YYYY-MM") from exc
+    if month > previous_complete_month(as_of):
+        raise SystemExit("--month 必须是 --as-of 之前已经完整结束的月份")
     if not 30 <= args.window_days <= 60:
         raise SystemExit("--window-days 必须在 30–60 之间")
     inbox_root = ROOT / "data" / "state" / "claim_inbox"
-    output = args.output or ROOT / "reports" / "monthly" / f"{args.month}-claim-review.md"
+    output = args.output or ROOT / "reports" / "monthly" / f"{month}-claim-review.md"
     rows, window_start, window_end = load_review_window(
-        inbox_root, args.month, args.window_days)
+        inbox_root, month, args.window_days)
     claims = bd.load_yaml("claims.yaml").get("claims", [])
-    text = render_review(args.month, rows, claims,
-                         window_start=window_start, window_end=window_end)
-    changed = atomic_write_if_changed(output, text)
+    text = render_review(month, rows, claims,
+                         window_start=window_start, window_end=window_end,
+                         as_of=window_end)
+    lock = ROOT / "data" / "state" / "locks" / f"monthly-review-{month}.lock"
+    with exclusive_lock(lock):
+        changed = atomic_write_if_changed(output, text)
     print(f"月度复盘{'已更新' if changed else '未变化'}：{output}（{len(rows)} 条信号）")
 
 

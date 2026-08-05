@@ -41,11 +41,19 @@ class AnalysisContextTest(unittest.TestCase):
         }]
 
     def test_only_matched_claim_gets_detail(self):
-        context = build_context("2026-08-04", self.claims, self.hits, {})
+        captures = [{"source_item_id": "test:collection",
+                     "snapshot_hash": "a" * 64}]
+        context = build_context("2026-08-04", self.claims, self.hits, {},
+                                source_captures=captures)
         self.assertEqual([c["id"] for c in context["active_claim_directory"]],
                          ["matched", "unmatched"])
         self.assertEqual([c["id"] for c in context["matched_claim_details"]], ["matched"])
         self.assertEqual(context["unmatched_active_claim_count"], 1)
+        self.assertEqual(context["source_capture_catalog"], captures)
+        detail = context["matched_claim_details"][0]
+        self.assertEqual(detail["evidence_record_total_not_strength"], 3)
+        self.assertEqual(detail["stance_counts"], {"legacy-unspecified": 3})
+        self.assertNotIn("evidence_total", detail)
 
     def test_selection_keeps_today_and_reversal(self):
         selected = select_evidence(self.claims[0], "2026-08-04", limit=2)
@@ -102,6 +110,18 @@ class AnalysisContextTest(unittest.TestCase):
         parsed = json.loads(enforce_budget(context, before - 10))
         self.assertEqual(parsed["omitted_broad_claim_ids"], ["broad"])
         self.assertEqual(parsed["broad_candidate_count"], 1)
+
+    def test_capture_catalog_is_trimmed_before_claim_detail(self):
+        captures = [{"source": f"s{i}", "source_item_id": f"s{i}:collection",
+                     "snapshot_hash": "a" * 64, "padding": "x" * 1000}
+                    for i in range(20)]
+        context = build_context("2026-08-04", self.claims, self.hits, {},
+                                source_captures=captures)
+        size = len(json.dumps(context, ensure_ascii=False, indent=2,
+                              sort_keys=True).encode("utf-8")) + 1
+        parsed = json.loads(enforce_budget(context, size - 500))
+        self.assertTrue(parsed.get("omitted_source_capture_ids"))
+        self.assertEqual([d["id"] for d in parsed["matched_claim_details"]], ["matched"])
 
     def test_budget_removes_the_selected_largest_detail(self):
         context = build_context("2026-08-04", self.claims, self.hits, {})

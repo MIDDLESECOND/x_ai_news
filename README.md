@@ -36,7 +36,9 @@ Register-ScheduledTask -TaskName "FrontierRadar-L1" -Action $action, $action2 -T
 - **悬案账本**（私有 `config/claims.yaml`）：每个未决论断记录证据与状态（open / leaning-yes / leaning-no / resolved），日报自动对照当日条目提示疑似新信号，把一次性调查变成累积性研究。
 - **单一事实源**：`claims.yaml` 是唯一权威判断源；自动上下文、月度复盘与 `reports/dossiers/` 都是可重建派生视图。
 - **受控写入**：无人值守流程只能通过 `apply_triage.py` 追加已验证的外部可点证据，不能自动新建悬案或改变状态。
+- **可审计证据身份**：自动证据逐 URL 保存，明确标注支持/反证/中立/混杂，并绑定抓取条目身份与快照哈希。
 - **报告分层**：`reports/dossiers/` 是机械证据档案；`reports/` 根目录的专题裁决报告仍由人工触发的 L2 深挖产生，自动化不会覆盖。
+- **统一收尾**：`finalize_daily.py` 在分诊和派生完成后计算产物指纹，镜像并核验私有仓库工作区与 Git 提交树，再用独立同步确认标记闭合最终回执；月度复盘自动选择上一个完整月份。
 - **信源发现**：不锁死在固定账号清单。聚合信源的引文作者自动累计（`data/candidates_ledger.json`，私有），达到阈值后提名、人工确认晋升。
 - **三条写作纪律**（见 [AGENTS.md](AGENTS.md)）：归因检查、警惕整齐结构、正确优先于连贯。
 

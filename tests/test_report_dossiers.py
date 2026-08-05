@@ -16,12 +16,16 @@ class ReportDossierTest(unittest.TestCase):
             "id": "claim-one", "claim": "测试悬案", "status": "open", "watch": "复测",
             "evidence": [
                 {"src": "lab", "type": "controlled", "verdict": "固定任务", "link": "https://lab.test/a", "date": "2026-08-01"},
-                {"src": "local", "type": "report", "verdict": "本地转述", "link": "D:\\private.md", "date": "2026-08-02"},
+                {"src": "local", "type": "report", "stance": "neutral", "verdict": "本地转述", "link": "D:\\private.md", "date": "2026-08-02",
+                 "source_item_id": "local:item", "snapshot_hash": "a" * 64},
             ]})
         self.assertIn("受控/可复核测试", text)
         self.assertIn("媒体或研究报告", text)
         self.assertIn("不可点本地材料或待补原始出处", text)
         self.assertIn("不是 L2 专题裁决报告", text)
+        self.assertIn("记录总数（不代表支持强度）", text)
+        self.assertIn("中立背景 1", text)
+        self.assertIn("旧记录未标注 1", text)
 
     def test_career_claim_is_skipped_and_final_report_untouched(self):
         with tempfile.TemporaryDirectory() as td:

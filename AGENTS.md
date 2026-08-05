@@ -52,9 +52,10 @@
 - `config/claims.yaml` 是唯一权威判断源；`data/state/current_analysis_context.json`、`reports/dossiers/` 与月度复盘均为可重建派生视图，不得反向覆盖账本。
 - 日常合成先运行 `scripts/build_analysis_context.py`，只展开高精度命中的悬案；`broad_claim_candidates` 只是召回候选，不能直接当证据。
 - 无法归入现有悬案、或影响可能大但可信度不足的信号，写入按月分片的 `data/state/claim_inbox/YYYY-MM.jsonl`；月份只是存储与复盘周期，不代表必须新建立案。
-- 无人值守流程不得直接编辑 `config/claims.yaml`。普通外部可点证据只可通过 `scripts/apply_triage.py` 追加；该入口明确禁止自动立案与自动改 `status`。状态变化和新悬案只能提名，交由人工或专题复核裁决。
+- 无人值守流程不得直接编辑 `config/claims.yaml`。普通外部可点证据只可通过 `scripts/apply_triage.py` 追加；每条自动证据必须是一 URL 一记录，并带 `stance`、`source_item_id` 与 `snapshot_hash`。该入口明确禁止自动立案与自动改 `status`。状态变化和新悬案只能提名，交由人工或专题复核裁决。
 - `reports/dossiers/` 只机械呈现账本已有证据，带 `ledger_ref` 的职业悬案默认跳过；正式 `reports/YYYY-MM-DD-<主题>.md` 不得被自动覆盖。
 - 所有派生写入必须幂等、加锁并原子替换；下游 dossier 或月度复盘失败不得阻断 brief 与私有备份。
+- 最终备份只能在合成、分诊与派生刷新之后由 `scripts/finalize_daily.py` 触发；`data/state/daily_runs/<date>.json` 是本日事务完成回执，只有同目录 `.sync.json` 的回执哈希确认存在才算同步闭环。备份前后产物指纹、目标受管范围与 Git 提交树必须一致；历史日期不得覆盖全局 current 上下文。
 
 ## 日常命令
 
@@ -80,6 +81,7 @@ python -m unittest discover -s tests
 python scripts/build_analysis_context.py
 python scripts/build_report_dossiers.py
 python scripts/build_monthly_claim_review.py --month YYYY-MM
+python scripts/finalize_daily.py --date YYYY-MM-DD
 ```
 
 ## 首要目标
