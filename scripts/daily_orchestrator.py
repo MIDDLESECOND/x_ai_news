@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
-"""开机即查的日常总调度：探针 → 抓取+机械日报 → 合成兜底 → 私有备份。
+"""开机即查的日常总调度：探针 → 机械日报 → 有界上下文 → 合成 → dossier → 备份。
 
 设计：幂等 + 有序。每个环节先查当天是否已完成，未完成才跑；全齐则秒退。
-触发（Windows 任务 FrontierRadar-Daily）：每天 09:00（WakeToRun）+ 每次登录。
+触发（Windows 任务）：FrontierRadar-Daily 每天 09:00（WakeToRun）+ 每次登录；
+FrontierRadar-SynthesisFallback 在 09:45–10:45 每 15 分钟重试一次本地合成兜底。
 电脑几点开机都行——登录触发会把当天缺的环节补齐。
 
 合成兜底：过了当天 09:45 日报仍是机械版（无「人工合成」标记）时，
-读取 daily-brief-synthesis 的 SKILL.md 作为提示词，用 `claude -p` 无头补跑。
+读取仓库私有 playbook 作为提示词，用 `claude -p` 无头补跑。
 正常情况下 App 的定时会话（09:30）会先完成合成，兜底不触发。
 """
+import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -17,12 +20,14 @@ from datetime import datetime
 from pathlib import Path
 
 from brief_marker import brief_synthesized  # 只依赖标准库，不会拖进 yaml/requests
+from synthesis_lease import acquire_lease, release_lease
 
 ROOT = Path(__file__).resolve().parent.parent
 LOCK = ROOT / "data" / "state" / "orchestrator.lock"
 LOG = ROOT / "data" / "state" / "orchestrator_log.jsonl"
-SKILL = Path.home() / ".claude" / "scheduled-tasks" / "daily-brief-synthesis" / "SKILL.md"
+SYNTH_PROMPT = ROOT / "playbooks" / "daily-brief-synthesis.md"
 SYNTH_FALLBACK_AFTER = (9, 45)     # 当天此时刻后日报仍为机械版才兜底
+APP_LEASE_STALE_AFTER = 30 * 60    # App 异常退出后，最多阻塞兜底 30 分钟
 
 if sys.stdout:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -37,13 +42,73 @@ def log(step, status, note=""):
     print(f"[{step}] {status}{'：' + note if note else ''}", flush=True)
 
 
-def run(cmd, timeout):
+def run(cmd, timeout, *, env=None):
     return subprocess.run(cmd, cwd=ROOT, timeout=timeout, capture_output=True,
                           text=True, encoding="utf-8", errors="replace",
-                          stdin=subprocess.DEVNULL)
+                          stdin=subprocess.DEVNULL, env=env)
 
 
-def main():
+def build_context(day):
+    result = run([sys.executable, "scripts/build_analysis_context.py", "--date", day],
+                 timeout=120)
+    log("context", "ok" if result.returncode == 0 else f"退出码 {result.returncode}",
+        ((result.stdout or "") + (result.stderr or "")).strip()[-200:])
+    return result
+
+
+def run_synthesis(day, brief, context_result):
+    """Run only the bounded synthesis step; never back up or push."""
+    h, m = SYNTH_FALLBACK_AFTER
+    current = datetime.now()  # 前面的探针可能跑很久，不能继续用进程启动时刻判断
+    past_cutoff = (current.hour, current.minute) >= (h, m)
+    if brief_synthesized(brief):
+        log("synthesis", "已是合成版，跳过")
+    elif not past_cutoff:
+        log("synthesis", f"未到兜底时刻（{h:02d}:{m:02d}），留给 App 定时会话")
+    elif context_result.returncode != 0:
+        log("synthesis", "skip", "当日有界上下文生成失败，拒绝使用旧上下文")
+    elif not SYNTH_PROMPT.exists():
+        log("synthesis", "skip", f"未找到 {SYNTH_PROMPT}")
+    elif not shutil.which("claude"):
+        log("synthesis", "skip", "claude CLI 不在 PATH")
+    else:
+        lease_token = acquire_lease(
+            ROOT, day, "orchestrator", stale_after=APP_LEASE_STALE_AFTER)
+        if lease_token is None:
+            log("synthesis", "skip", "App 合成会话持有共享 lease，本次不并发兜底")
+        else:
+            try:
+                text = SYNTH_PROMPT.read_text(encoding="utf-8")
+                if text.startswith("---"):  # 去掉 frontmatter
+                    text = text.split("---", 2)[-1]
+                prompt = (text.strip()
+                          + f"\n\n（本次为无人值守兜底运行，今天的日期是 {day}；"
+                            "共享 synthesis lease 已由 orchestrator 持有，"
+                            "跳过 playbook 中的 acquire/release；"
+                            "数据与机械版日报应已就绪，若缺失按提示词步骤 1 处理。）")
+                # 本机可能残留失效的 API key；Claude CLI 会优先于已登录的
+                # claude.ai 会话读取它，导致兜底稳定报 401。只对子进程移除，
+                # 不修改用户的持久环境。
+                synthesis_env = os.environ.copy()
+                synthesis_env.pop("ANTHROPIC_API_KEY", None)
+                synthesis_result = run(
+                    [shutil.which("claude"), "-p", prompt,
+                     "--permission-mode", "acceptEdits",
+                     "--tools", "Read,Write,Edit,Bash",
+                     "--allowedTools", "Read", "Write", "Edit",
+                     "Bash(python scripts/build_analysis_context.py *)",
+                     "Bash(python scripts/signal_inbox.py add --input data/state/pending_inbox.json)",
+                     "Bash(python scripts/apply_triage.py --input data/state/pending_evidence.json)",
+                     "Bash(python scripts/build_report_dossiers.py)",
+                     "--disallowedTools", "PowerShell", "WebFetch", "WebSearch"],
+                    timeout=2400, env=synthesis_env)
+                log("synthesis", "ok" if brief_synthesized(brief) else "兜底后仍非合成版",
+                    (synthesis_result.stdout or "").strip()[-200:])
+            finally:
+                release_lease(ROOT, day, "orchestrator")
+
+
+def main(*, synthesis_only=False):
     now = datetime.now()
     day = now.strftime("%Y-%m-%d")
     raw = ROOT / "data" / "raw" / day
@@ -57,6 +122,13 @@ def main():
     LOCK.write_text(day, encoding="utf-8")
 
     try:
+        if synthesis_only:
+            if not (raw / "_fetch_log.json").exists() or not brief.exists():
+                log("synthesis", "skip", "当日原始数据或机械日报未就绪")
+                return
+            run_synthesis(day, brief, build_context(day))
+            return
+
         # 1. 账号探针（每天一次；auth 失败时 run_probe 自身会整臂跳过）
         if (raw / "probe.json").exists():
             log("probe", "已完成，跳过")
@@ -81,36 +153,28 @@ def main():
         else:
             log("digest", "已完成，跳过")
 
-        # 3. 合成兜底（App 定时会话没跑成时才出手）
-        h, m = SYNTH_FALLBACK_AFTER
-        past_cutoff = (now.hour, now.minute) >= (h, m)
-        if brief_synthesized(brief):
-            log("synthesis", "已是合成版，跳过")
-        elif not past_cutoff:
-            log("synthesis", f"未到兜底时刻（{h:02d}:{m:02d}），留给 App 定时会话")
-        elif not SKILL.exists():
-            log("synthesis", "skip", f"未找到 {SKILL}")
-        elif not shutil.which("claude"):
-            log("synthesis", "skip", "claude CLI 不在 PATH")
-        else:
-            text = SKILL.read_text(encoding="utf-8")
-            if text.startswith("---"):  # 去掉 frontmatter
-                text = text.split("---", 2)[-1]
-            prompt = (text.strip()
-                      + f"\n\n（本次为无人值守兜底运行，今天的日期是 {day}；"
-                        f"数据与机械版日报应已就绪，若缺失按提示词步骤 1 处理。）")
-            p = run([shutil.which("claude"), "-p", prompt,
-                     "--permission-mode", "acceptEdits"], timeout=2400)
-            log("synthesis", "ok" if brief_synthesized(brief) else "兜底后仍非合成版",
-                (p.stdout or "").strip()[-200:])
+        # 3. 生成有界分析上下文。失败不破坏机械日报，但不允许静默使用旧日期上下文。
+        context_result = build_context(day)
 
-        # 4. 私有备份（脚本自身无变更不提交；把当天已产出的东西尽早送出去）
-        p = run([sys.executable, "scripts/backup_private.py"], timeout=900)
-        log("backup", "ok" if p.returncode == 0 else f"退出码 {p.returncode}",
-            (p.stdout or "").strip()[-200:])
+        # 4. 合成兜底（App 定时会话没跑成时才出手）
+        run_synthesis(day, brief, context_result)
+
+        # 5. 派生 dossier 非阻塞：失败不得拖垮日报或备份，也不得碰正式专题报告。
+        dossier = run([sys.executable, "scripts/build_report_dossiers.py"], timeout=120)
+        log("dossiers", "ok" if dossier.returncode == 0 else f"退出码 {dossier.returncode}",
+            ((dossier.stdout or "") + (dossier.stderr or "")).strip()[-200:])
+
+        # 6. 私有备份（脚本自身无变更不提交；把当天已产出的东西尽早送出去）
+        backup_result = run([sys.executable, "scripts/backup_private.py"], timeout=900)
+        log("backup", "ok" if backup_result.returncode == 0
+            else f"退出码 {backup_result.returncode}",
+            (backup_result.stdout or "").strip()[-200:])
     finally:
         LOCK.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--synthesis-only", action="store_true",
+                    help="只运行本地合成兜底；不抓取、不执行独立备份或推送")
+    main(synthesis_only=ap.parse_args().synthesis_only)

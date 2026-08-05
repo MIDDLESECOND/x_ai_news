@@ -47,6 +47,15 @@
 - **悬案只改判、不删除。** 状态变更必须保留原判与改判理由（写在 `status` 行上方注释）；确需作废的标注为被取代，写明替代者与原因。删掉一条悬案等于连同它承载的整条证据链一起删掉，而这些证据往往不可重新采集。
 - 专题报告存本地 `reports/`，结构对齐既有报告：逐条主张给判定、证据分层标注、具名引述附推文链接、n=1 与对照测试区分。
 
+## 增量分析与自动派生边界
+
+- `config/claims.yaml` 是唯一权威判断源；`data/state/current_analysis_context.json`、`reports/dossiers/` 与月度复盘均为可重建派生视图，不得反向覆盖账本。
+- 日常合成先运行 `scripts/build_analysis_context.py`，只展开高精度命中的悬案；`broad_claim_candidates` 只是召回候选，不能直接当证据。
+- 无法归入现有悬案、或影响可能大但可信度不足的信号，写入按月分片的 `data/state/claim_inbox/YYYY-MM.jsonl`；月份只是存储与复盘周期，不代表必须新建立案。
+- 无人值守流程不得直接编辑 `config/claims.yaml`。普通外部可点证据只可通过 `scripts/apply_triage.py` 追加；该入口明确禁止自动立案与自动改 `status`。状态变化和新悬案只能提名，交由人工或专题复核裁决。
+- `reports/dossiers/` 只机械呈现账本已有证据，带 `ledger_ref` 的职业悬案默认跳过；正式 `reports/YYYY-MM-DD-<主题>.md` 不得被自动覆盖。
+- 所有派生写入必须幂等、加锁并原子替换；下游 dossier 或月度复盘失败不得阻断 brief 与私有备份。
+
 ## 日常命令
 
 ```bash
@@ -64,6 +73,14 @@ python -m unittest discover -s tests
 它钉住的不只是代码行为，还有本文件的纪律本身：`leaning-yes`/`resolved` 状态必须至少有一条可点出处（纪律 1）、挂 `ledger_ref` 的悬案必须逐条三选一标注、open 悬案不得出现求职硬门槛措辞。**新增或修改悬案后必须重跑**，否则纪律退回"只写在文档里"。
 
 当日日报若已是**人工合成版**，build_digest 拒绝覆盖并以退出码 1 退出（`briefs/` 不入库，覆盖即永久丢失）。确需重建机械版才加 `--force`——它会先把原件字节级拷贝到 `data/state/brief_backups/<date>.synth.bak` 再重建。
+
+增量分析与派生视图：
+
+```bash
+python scripts/build_analysis_context.py
+python scripts/build_report_dossiers.py
+python scripts/build_monthly_claim_review.py --month YYYY-MM
+```
 
 ## 首要目标
 
