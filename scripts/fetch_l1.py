@@ -10,9 +10,11 @@ data/raw 按日期目录自动保留最近 N 天（--keep-days，默认 45）。
 """
 import argparse
 import hashlib
+import ipaddress
 import json
 import re
 import shutil
+import socket
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -110,12 +112,69 @@ class ResponseTooLarge(requests.RequestException):
     """A response exceeded the configured decoded-body transport ceiling."""
 
 
+class UnsafeRedirectTarget(requests.RequestException):
+    """An untrusted redirect resolved outside the public Internet boundary."""
+
+
 def close_response(response):
     """Release a streamed response, tolerating test/custom adapters without raw."""
     try:
         response.close()
     except (AttributeError, OSError):
         pass
+
+
+def validate_public_redirect_target(url):
+    """Fail closed unless every resolved redirect address is globally routable."""
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError as error:
+        raise UnsafeRedirectTarget(f"无效重定向目标：{url}") from error
+    scheme = parts.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise UnsafeRedirectTarget(f"不支持的重定向协议：{scheme or '(empty)'}")
+    host = (parts.hostname or "").lower().rstrip(".")
+    if not host:
+        raise UnsafeRedirectTarget("重定向目标缺少主机名")
+    if parts.username is not None or parts.password is not None:
+        raise UnsafeRedirectTarget("重定向目标不得包含用户凭据")
+    expected_port = 443 if scheme == "https" else 80
+    if port not in (None, expected_port):
+        raise UnsafeRedirectTarget(
+            f"重定向目标端口不在允许范围：{port}")
+    if host == "localhost" or host.endswith(".localhost") or "%" in host:
+        raise UnsafeRedirectTarget(f"重定向目标不是公网主机：{host}")
+
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            answers = socket.getaddrinfo(
+                host, port or expected_port, type=socket.SOCK_STREAM)
+        except OSError as error:
+            raise UnsafeRedirectTarget(
+                f"重定向目标 DNS 解析失败：{host}") from error
+        addresses = {str(answer[4][0]).split("%", 1)[0] for answer in answers}
+        if not addresses:
+            raise UnsafeRedirectTarget(f"重定向目标没有 A/AAAA 地址：{host}")
+        try:
+            resolved = [ipaddress.ip_address(value) for value in addresses]
+        except ValueError as error:
+            raise UnsafeRedirectTarget(
+                f"重定向目标返回无效地址：{host}") from error
+    else:
+        resolved = [literal]
+
+    # ipaddress treats some multicast ranges as global in the sense of their
+    # scope.  Redirects need a stricter public-unicast boundary.
+    unsafe = sorted(
+        str(address) for address in resolved
+        if not address.is_global or address.is_multicast)
+    if unsafe:
+        raise UnsafeRedirectTarget(
+            f"重定向目标包含非公网地址：{', '.join(unsafe)}")
+    return url
 
 
 def validate_http_response(response, response_kind):
@@ -290,8 +349,10 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
         # hard gate, so a disabled policy can never be preceded by this delay.
         _sleep_with_lease_heartbeat(delay_before, key_lease)
 
-    def request_hop(request_url, request_headers):
+    def request_hop(request_url, request_headers, *, untrusted_redirect=False):
         nonlocal attempts, retry_after_observed, retry_after_waited, retried_429
+        if untrusted_redirect:
+            validate_public_redirect_target(request_url)
         with request_lease(cache_root, host_lease_key(request_url)) as host_lease:
             blocked_until, blocked_error = host_cooldown(
                 cache_root, request_url, now=now)
@@ -305,6 +366,10 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
                     request_url,
                     sleep_fn=lambda seconds: _sleep_with_lease_heartbeat(
                         seconds, key_lease, host_lease))
+                if untrusted_redirect:
+                    # Resolve immediately before each real attempt, including a
+                    # retry after a long rate-limit wait.
+                    validate_public_redirect_target(request_url)
                 attempts += 1
                 return requests.get(
                     request_url, headers=request_headers, timeout=TIMEOUT,
@@ -346,8 +411,11 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
         current_url = start_url
         current_headers = dict(initial_headers)
         history = []
+        untrusted_redirect = False
         for redirect_count in range(6):
-            response = request_hop(current_url, current_headers)
+            response = request_hop(
+                current_url, current_headers,
+                untrusted_redirect=untrusted_redirect)
             location = response.headers.get("Location")
             if response.status_code not in {301, 302, 303, 307, 308}:
                 response.history = history
@@ -363,8 +431,7 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
             history.append(response)
             current_url = urljoin(response.url or current_url, location)
             close_response(response)
-            if urlsplit(current_url).scheme.lower() not in {"http", "https"}:
-                raise requests.InvalidURL(f"不支持的重定向目标：{current_url}")
+            untrusted_redirect = True
             # Validators describe the original selected representation and must
             # not leak to or incorrectly validate a redirect target.
             current_headers.pop("If-None-Match", None)
@@ -437,18 +504,19 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
         status_code = getattr(resp, "status_code", None)
         validation_error = isinstance(error, ResponseValidationError)
         oversized = isinstance(error, ResponseTooLarge)
+        unsafe_redirect = isinstance(error, UnsafeRedirectTarget)
         transport_error = isinstance(error, (
             requests.ConnectionError, requests.Timeout,
             requests.exceptions.ChunkedEncodingError,
             requests.exceptions.ContentDecodingError))
-        if oversized:
+        if oversized or unsafe_redirect:
             discard_cached_response(
                 cache_root, prepared, now=now, logical_day=logical_day,
                 error=f"{type(error).__name__}: {error}")
-        retryable = (validation_error or oversized or transport_error
+        retryable = (validation_error or oversized or unsafe_redirect or transport_error
                      or status_code is None or status_code in {
             408, 425, 429, 500, 502, 503, 504})
-        allow_stale = (not validation_error and not oversized and (
+        allow_stale = (not validation_error and not oversized and not unsafe_redirect and (
             transport_error or status_code is None
             or status_code in {500, 502, 503, 504}))
         retry_after = max(

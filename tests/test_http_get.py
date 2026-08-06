@@ -55,6 +55,13 @@ class HttpGetTest(unittest.TestCase):
         response.close = Mock()
         return response
 
+    @staticmethod
+    def dns_answers(*addresses, port=443):
+        return [
+            (fl.socket.AF_INET, fl.socket.SOCK_STREAM, 6, "", (address, port))
+            for address in addresses
+        ]
+
     def test_reddit_request_reserves_shared_rate_limit_slot(self):
         response = self.response()
         with patch.object(fl, "reserve_request") as reserve:
@@ -414,8 +421,12 @@ class HttpGetTest(unittest.TestCase):
         final.url = target
 
         with patch.object(fl, "reserve_request") as reserve:
-            with patch.object(fl.requests, "get", side_effect=[redirected, final]):
-                response = self.get(start)
+            with patch.object(
+                    fl.socket, "getaddrinfo",
+                    return_value=self.dns_answers("151.101.1.140")):
+                with patch.object(
+                        fl.requests, "get", side_effect=[redirected, final]):
+                    response = self.get(start)
 
         self.assertEqual(response.content, b"feed-v1")
         redirected.close.assert_called_once()
@@ -424,6 +435,103 @@ class HttpGetTest(unittest.TestCase):
         self.assertEqual(
             reserve.call_args_list,
             [call(start, sleep_fn=ANY), call(target, sleep_fn=ANY)])
+
+    def test_redirect_to_literal_private_address_is_blocked_before_request(self):
+        start = "https://redirect.example/feed"
+        target = "http://169.254.169.254/latest/meta-data"
+        redirected = self.response(
+            status=302, content=b"", headers={"Location": target})
+        redirected.url = start
+        with patch.object(fl.requests, "get", return_value=redirected) as get:
+            with self.assertRaises(fl.UnsafeRedirectTarget):
+                self.get(start)
+
+        get.assert_called_once()
+        entry = load_entry(self.cache_root, request_key(start))
+        self.assertTrue(entry.get("retry_at"))
+        self.assertFalse(entry.get("allow_stale"))
+
+    def test_redirect_with_any_private_dns_answer_is_blocked(self):
+        start = "https://redirect.example/feed"
+        target = "https://mixed.example/feed"
+        redirected = self.response(
+            status=302, content=b"", headers={"Location": target})
+        redirected.url = start
+        answers = self.dns_answers("93.184.216.34", "10.0.0.8")
+        with patch.object(fl.socket, "getaddrinfo", return_value=answers):
+            with patch.object(fl.requests, "get", return_value=redirected) as get:
+                with self.assertRaises(fl.UnsafeRedirectTarget):
+                    self.get(start)
+        get.assert_called_once()
+
+    def test_redirect_is_reresolved_immediately_before_request(self):
+        start = "https://redirect.example/feed"
+        target = "https://rebound.example/feed"
+        redirected = self.response(
+            status=302, content=b"", headers={"Location": target})
+        redirected.url = start
+        answers = [
+            self.dns_answers("93.184.216.34"),
+            self.dns_answers("127.0.0.1"),
+        ]
+        with patch.object(fl.socket, "getaddrinfo", side_effect=answers) as dns:
+            with patch.object(fl.requests, "get", return_value=redirected) as get:
+                with self.assertRaises(fl.UnsafeRedirectTarget):
+                    self.get(start)
+
+        self.assertEqual(dns.call_count, 2)
+        get.assert_called_once()
+
+    def test_redirect_rejects_credentials_and_nonstandard_ports(self):
+        for target in (
+                "https://user:secret@public.example/feed",
+                "https://public.example:8443/feed"):
+            with self.subTest(target=target):
+                with self.assertRaises(fl.UnsafeRedirectTarget):
+                    fl.validate_public_redirect_target(target)
+
+    def test_redirect_rejects_ipv6_loopback_and_multicast_literals(self):
+        for target in (
+                "https://[::1]/feed",
+                "http://224.0.0.1/feed",
+                "https://[ff0e::1]/feed"):
+            with self.subTest(target=target):
+                with self.assertRaises(fl.UnsafeRedirectTarget):
+                    fl.validate_public_redirect_target(target)
+
+    def test_redirect_dns_failure_is_blocked(self):
+        with patch.object(
+                fl.socket, "getaddrinfo",
+                side_effect=fl.socket.gaierror("not found")):
+            with self.assertRaises(fl.UnsafeRedirectTarget):
+                fl.validate_public_redirect_target(
+                    "https://unresolved.example/feed")
+
+    def test_unsafe_redirect_tombstones_cached_body_and_enters_cooldown(self):
+        start = "https://redirect.example/cached-feed"
+        first = self.response(
+            headers={"ETag": '"v1"', "Cache-Control": "max-age=0"})
+        with patch.object(fl.requests, "get", return_value=first):
+            self.get(start)
+
+        self.now += timedelta(minutes=1)
+        redirected = self.response(
+            status=302, content=b"",
+            headers={"Location": "http://127.0.0.1/admin"})
+        redirected.url = start
+        with patch.object(fl.requests, "get", return_value=redirected):
+            with self.assertRaises(fl.UnsafeRedirectTarget):
+                self.get(start)
+
+        entry = load_entry(self.cache_root, request_key(start))
+        self.assertFalse(entry.get("body_sha256"))
+        self.assertFalse(entry.get("allow_stale"))
+        self.assertTrue(entry.get("retry_at"))
+        self.now += timedelta(minutes=1)
+        with patch.object(fl.requests, "get") as get:
+            with self.assertRaises(fl.FetchCooldown):
+                self.get(start)
+        get.assert_not_called()
 
     def test_source_delay_runs_only_for_a_real_non_reddit_request(self):
         url = "https://status.example/delayed-feed"
@@ -458,9 +566,13 @@ class HttpGetTest(unittest.TestCase):
         limited.url = target
         limited.headers["Retry-After"] = "3600"
         limited._content = b"unavailable"
-        with patch.object(fl.requests, "get", side_effect=[redirected, limited]):
-            with self.assertRaises(requests.HTTPError):
-                self.get(start)
+        with patch.object(
+                fl.socket, "getaddrinfo",
+                return_value=self.dns_answers("93.184.216.34")):
+            with patch.object(
+                    fl.requests, "get", side_effect=[redirected, limited]):
+                with self.assertRaises(requests.HTTPError):
+                    self.get(start)
 
         self.now += timedelta(minutes=1)
         with patch.object(fl.requests, "get") as get:
