@@ -16,6 +16,7 @@ import re
 import shutil
 import socket
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
@@ -41,6 +42,8 @@ TIMEOUT = 30
 HTTP_FORCE_REVALIDATE = False
 HTTP_LOGICAL_DAY = None
 _HTTP_EVENTS = []
+_monotonic = time.monotonic
+_download_timer = threading.Timer
 
 X_LINK_RE = re.compile(r"https?://(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})/status/(\d+)")
 HTTP_URL_RE = re.compile(r"https?://[^\s<>'\"&]+", re.IGNORECASE)
@@ -110,6 +113,10 @@ class ResponseValidationError(requests.RequestException):
 
 class ResponseTooLarge(requests.RequestException):
     """A response exceeded the configured decoded-body transport ceiling."""
+
+
+class ResponseDownloadTimeout(requests.Timeout):
+    """A streamed response exceeded its cumulative body-read time ceiling."""
 
 
 class UnsafeRedirectTarget(requests.RequestException):
@@ -190,8 +197,8 @@ def validate_http_response(response, response_kind):
             raise ResponseValidationError("HTTP 200 正文不是有效 XML") from error
 
 
-def materialize_response_body(response, max_bytes):
-    """Read a streamed response into memory without ever crossing *max_bytes*."""
+def materialize_response_body(response, max_bytes, max_seconds=None):
+    """Read a stream within decoded-byte and cumulative body-time ceilings."""
     limit = max(0, int(max_bytes))
     preloaded = getattr(response, "_content", False)
     if not isinstance(response, requests.Response):
@@ -220,8 +227,31 @@ def materialize_response_body(response, max_bytes):
 
     chunks = []
     total = 0
+    time_limit = (
+        None if max_seconds is None else max(0, int(max_seconds)))
+    if time_limit == 0:
+        close_response(response)
+        raise ResponseDownloadTimeout(
+            "流式正文读取达到 0 秒上限", response=response)
+    started_at = _monotonic() if time_limit is not None else None
+    deadline_reached = threading.Event()
+    watchdog = None
+    if time_limit is not None:
+        def expire_download():
+            deadline_reached.set()
+            close_response(response)
+
+        watchdog = _download_timer(time_limit, expire_download)
+        watchdog.daemon = True
+        watchdog.start()
     try:
         for chunk in response.iter_content(chunk_size=64 * 1024):
+            if (deadline_reached.is_set()
+                    or (time_limit is not None
+                        and _monotonic() - started_at >= time_limit)):
+                raise ResponseDownloadTimeout(
+                    f"流式正文读取达到 {time_limit} 秒上限",
+                    response=response)
             if not chunk:
                 continue
             total += len(chunk)
@@ -229,10 +259,25 @@ def materialize_response_body(response, max_bytes):
                 raise ResponseTooLarge(
                     f"流式正文超过上限 {limit} 字节", response=response)
             chunks.append(chunk)
+        if (deadline_reached.is_set()
+                or (time_limit is not None
+                    and _monotonic() - started_at >= time_limit)):
+            raise ResponseDownloadTimeout(
+                f"流式正文读取达到 {time_limit} 秒上限",
+                response=response)
         response._content = b"".join(chunks)
         response._content_consumed = True
         return response
+    except Exception as error:
+        if (deadline_reached.is_set()
+                and not isinstance(error, ResponseDownloadTimeout)):
+            raise ResponseDownloadTimeout(
+                f"流式正文读取达到 {time_limit} 秒上限",
+                response=response) from error
+        raise
     finally:
+        if watchdog is not None:
+            watchdog.cancel()
         close_response(response)
 
 
@@ -340,7 +385,9 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
     retry_after_waited = 0
     resp = None
     retried_429 = False
-    max_download_bytes = resolve_policy(source)["max_download_bytes"]
+    policy = resolve_policy(source)
+    max_download_bytes = policy["max_download_bytes"]
+    max_download_seconds = policy["max_download_seconds"]
 
     delay_before = max(0.0, float((source or {}).get("delay_before") or 0))
     if delay_before and not is_reddit_url(url):
@@ -455,7 +502,8 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
                 resp = restored
         if getattr(resp, "frontier_cache_status", "") != "revalidated":
             resp.raise_for_status()
-            materialize_response_body(resp, max_download_bytes)
+            materialize_response_body(
+                resp, max_download_bytes, max_download_seconds)
             try:
                 validate_http_response(resp, response_kind)
             except ResponseValidationError as error:
@@ -468,7 +516,8 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
                 logical_day=logical_day)
         else:
             try:
-                materialize_response_body(resp, max_download_bytes)
+                materialize_response_body(
+                    resp, max_download_bytes, max_download_seconds)
                 validate_http_response(resp, response_kind)
             except ResponseTooLarge as error:
                 # A 304 proves the oversized cached representation is unchanged;
@@ -485,7 +534,8 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
                 headers.pop("If-Modified-Since", None)
                 resp = request_chain(url, headers)
                 resp.raise_for_status()
-                materialize_response_body(resp, max_download_bytes)
+                materialize_response_body(
+                    resp, max_download_bytes, max_download_seconds)
                 validate_http_response(resp, response_kind)
                 resp = store_success(
                     cache_root, prepared, resp, source=source, now=now,

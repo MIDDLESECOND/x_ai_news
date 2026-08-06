@@ -339,6 +339,15 @@ class HttpGetTest(unittest.TestCase):
             "fetch_policy": {"max_download_bytes": 1024},
         })["max_download_bytes"], 1024)
 
+    def test_download_time_cap_can_tighten_but_not_exceed_hard_default(self):
+        hard_cap = 120
+        self.assertEqual(fl.resolve_policy({
+            "fetch_policy": {"max_download_seconds": hard_cap * 10},
+        })["max_download_seconds"], hard_cap)
+        self.assertEqual(fl.resolve_policy({
+            "fetch_policy": {"max_download_seconds": 5},
+        })["max_download_seconds"], 5)
+
     def test_chunked_body_is_stopped_when_decoded_bytes_cross_cap(self):
         url = "https://stream.example/chunked-large"
         response = self.streamed_response([b"a" * 60, b"b" * 41], url=url)
@@ -361,6 +370,121 @@ class HttpGetTest(unittest.TestCase):
         response.close.assert_called_once()
         entry = load_entry(self.cache_root, request_key(url, source_id="bounded"))
         self.assertTrue(entry.get("body_sha256"))
+
+    def test_slow_stream_is_stopped_after_download_time_cap(self):
+        url = "https://stream.example/slow"
+        response = self.streamed_response([b"feed-", b"v1"], url=url)
+        source = {
+            "id": "bounded",
+            "fetch_policy": {
+                "max_download_bytes": 100,
+                "max_download_seconds": 1,
+            },
+        }
+        with patch.object(fl, "_monotonic", side_effect=[100.0, 100.5, 101.1]):
+            with patch.object(fl.requests, "get", return_value=response):
+                with self.assertRaises(fl.ResponseDownloadTimeout):
+                    self.get(url, source=source)
+
+        response.close.assert_called()
+        entry = load_entry(
+            self.cache_root, request_key(url, source_id="bounded"))
+        self.assertTrue(entry.get("retry_at"))
+        self.assertTrue(entry.get("allow_stale"))
+
+    def test_streamed_body_within_time_cap_is_cached(self):
+        url = "https://stream.example/fast"
+        response = self.streamed_response([b"feed-", b"v1"], url=url)
+        source = {
+            "id": "bounded",
+            "fetch_policy": {
+                "max_download_bytes": 100,
+                "max_download_seconds": 1,
+            },
+        }
+        with patch.object(
+                fl, "_monotonic",
+                side_effect=[100.0, 100.4, 100.8, 100.9]):
+            with patch.object(fl.requests, "get", return_value=response):
+                result = self.get(url, source=source)
+
+        self.assertEqual(result.content, b"feed-v1")
+        entry = load_entry(
+            self.cache_root, request_key(url, source_id="bounded"))
+        self.assertTrue(entry.get("body_sha256"))
+
+    def test_download_watchdog_closes_stream_at_deadline(self):
+        url = "https://stream.example/watchdog"
+        response = self.streamed_response([b"feed"], url=url)
+        response.iter_content.side_effect = (
+            requests.exceptions.ChunkedEncodingError("closed by watchdog"))
+        source = {
+            "id": "bounded",
+            "fetch_policy": {"max_download_seconds": 5},
+        }
+        timer = Mock()
+
+        def timer_factory(seconds, callback):
+            self.assertEqual(seconds, 5)
+            timer.start.side_effect = callback
+            return timer
+
+        with patch.object(fl, "_download_timer", side_effect=timer_factory):
+            with patch.object(fl, "_monotonic", return_value=100.0):
+                with patch.object(fl.requests, "get", return_value=response):
+                    with self.assertRaises(
+                            fl.ResponseDownloadTimeout) as raised:
+                        self.get(url, source=source)
+
+        self.assertIsInstance(
+            raised.exception.__cause__,
+            requests.exceptions.ChunkedEncodingError)
+        timer.start.assert_called_once()
+        timer.cancel.assert_called_once()
+        response.close.assert_called()
+
+    def test_zero_download_time_cap_rejects_before_stream_read(self):
+        url = "https://stream.example/disabled-body"
+        response = self.streamed_response([b"feed"], url=url)
+        source = {
+            "id": "bounded",
+            "fetch_policy": {"max_download_seconds": 0},
+        }
+        with patch.object(fl.requests, "get", return_value=response):
+            with self.assertRaises(fl.ResponseDownloadTimeout):
+                self.get(url, source=source)
+
+        response.iter_content.assert_not_called()
+        response.close.assert_called()
+
+    def test_download_time_failure_can_serve_prior_validated_stale_body(self):
+        url = "https://stream.example/stale-after-slow"
+        source = {
+            "id": "bounded",
+            "fetch_policy": {
+                "max_download_bytes": 100,
+                "max_download_seconds": 1,
+            },
+        }
+        first = self.response(
+            content=b"old-feed",
+            headers={"ETag": '"v1"', "Cache-Control": "max-age=0"})
+        with patch.object(fl.requests, "get", return_value=first):
+            self.get(url, source=source)
+
+        self.now += timedelta(minutes=1)
+        slow = self.streamed_response([b"new-", b"feed"], url=url)
+        with patch.object(fl, "_monotonic", side_effect=[100.0, 101.1]):
+            with patch.object(fl.requests, "get", return_value=slow):
+                with self.assertRaises(fl.ResponseDownloadTimeout):
+                    self.get(url, source=source)
+
+        self.now += timedelta(minutes=1)
+        with patch.object(fl.requests, "get") as get:
+            stale = self.get(url, source=source)
+        get.assert_not_called()
+        self.assertEqual(stale.content, b"old-feed")
+        self.assertEqual(stale.frontier_cache_status, "stale_backoff")
 
     def test_stream_decode_failure_remains_retryable_network_failure(self):
         url = "https://stream.example/broken"
