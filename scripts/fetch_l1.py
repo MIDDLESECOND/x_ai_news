@@ -473,6 +473,7 @@ def fetch_openrouter_prices(src):
         except (TypeError, ValueError):
             continue
     state = load_state("openrouter_prices")
+    validate_price_snapshot("OpenRouter", state, tracked)
     now = datetime.now(timezone.utc).isoformat()
     items = []
     if not state:
@@ -499,7 +500,150 @@ def fetch_openrouter_prices(src):
                     "summary": "输入/输出牌价（每百万 token）变动",
                 })
     save_state("openrouter_prices", tracked)
-    return items[:20]
+    return items
+
+
+def _price_match_text(value):
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def validate_price_snapshot(name, previous, current, *, min_retained_ratio=0.5):
+    """Fail closed before an empty or structurally collapsed snapshot is saved."""
+    if not current:
+        raise RuntimeError(f"{name} 返回空价格快照，拒绝覆盖既有基线")
+    if not previous:
+        return
+    retained = len(set(previous) & set(current))
+    ratio = retained / len(previous)
+    if ratio < min_retained_ratio:
+        raise RuntimeError(
+            f"{name} 价格快照仅保留旧基线 {retained}/{len(previous)} 个模型 "
+            f"({ratio:.1%})，疑似上游或关键词异常，拒绝覆盖"
+        )
+
+
+def extract_genai_price_snapshot(data, model_keywords):
+    """Extract tracked model price records from pydantic/genai-prices v2.
+
+    The returned snapshot deliberately preserves conditional/tiered price
+    structures.  It is an aggregator observation, never a replacement for the
+    provider's official pricing page.
+    """
+    if not isinstance(data, list):
+        raise ValueError("genai-prices v2 顶层必须是 provider 数组")
+    keywords = [_price_match_text(keyword) for keyword in model_keywords if str(keyword).strip()]
+    snapshot = {}
+    for provider in data:
+        if not isinstance(provider, dict):
+            continue
+        provider_id = str(provider.get("id") or "").strip()
+        provider_name = str(provider.get("name") or provider_id).strip()
+        if not provider_id:
+            continue
+        pricing_urls = provider.get("pricing_urls") or []
+        pricing_url = next((str(value) for value in pricing_urls if value), "")
+        for model in provider.get("models") or []:
+            if not isinstance(model, dict) or model.get("prices") is None:
+                continue
+            model_id = str(model.get("id") or "").strip()
+            if not model_id:
+                continue
+            model_name = str(model.get("name") or model_id).strip()
+            haystack = _price_match_text(
+                f"{provider_id} {provider_name} {model_id} {model_name}")
+            if keywords and not any(keyword in haystack for keyword in keywords):
+                continue
+            key = f"{provider_id}/{model_id}"
+            snapshot[key] = {
+                "provider_id": provider_id,
+                "provider_name": provider_name,
+                "model_id": model_id,
+                "model_name": model_name,
+                "context_window": model.get("context_window"),
+                "prices": model["prices"],
+                "pricing_url": pricing_url,
+            }
+    return snapshot
+
+
+def _compact_prices(prices):
+    if isinstance(prices, list):
+        groups = []
+        for index, entry in enumerate(prices, start=1):
+            if not isinstance(entry, dict):
+                groups.append(f"组{index}: {entry}")
+                continue
+            constraint = entry.get("constraint") or {}
+            label = (json.dumps(constraint, ensure_ascii=False, sort_keys=True,
+                                separators=(",", ":"))
+                     if constraint else "default")
+            groups.append(f"{label}: {_compact_prices(entry.get('prices'))}")
+        return " | ".join(groups)
+    if not isinstance(prices, dict):
+        return str(prices)
+    preferred = ["input_mtok", "cache_read_mtok", "cache_write_mtok", "output_mtok"]
+    keys = [key for key in preferred if key in prices]
+    keys.extend(sorted(key for key in prices if key not in preferred))
+    parts = [
+        f"{key}=${prices[key]}/M" if key.endswith("_mtok") else f"{key}={prices[key]}"
+        for key in keys
+    ]
+    return ", ".join(parts)
+
+
+def _genai_record_url(provider_id, model_id):
+    quoted = requests.utils.quote(str(provider_id), safe="")
+    model = requests.utils.quote(str(model_id), safe="")
+    return ("https://github.com/pydantic/genai-prices/blob/main/"
+            f"prices/providers/{quoted}.yml?model={model}&plain=1")
+
+
+def diff_genai_price_snapshots(previous, current, published):
+    """Return only new models and exact structured price changes."""
+    items = []
+    for key, record in sorted(current.items()):
+        old = previous.get(key)
+        url = _genai_record_url(record["provider_id"], record["model_id"])
+        boundary = "聚合价格索引的结构化记录；不得替代厂商官方价格页"
+        if old is None:
+            items.append({
+                "title": (f"[genai-prices] new model: {record['model_name']} "
+                          f"（{_compact_prices(record['prices'])}）"),
+                "url": url,
+                "published": published,
+                "summary": f"{boundary}；厂商价目参考：{record.get('pricing_url') or '未提供'}",
+            })
+        elif old.get("prices") != record.get("prices"):
+            items.append({
+                "title": (f"[genai-prices] price change: {record['model_name']} "
+                          f"{_compact_prices(old.get('prices'))} → "
+                          f"{_compact_prices(record.get('prices'))}"),
+                "url": url,
+                "published": published,
+                "summary": f"{boundary}；厂商价目参考：{record.get('pricing_url') or '未提供'}",
+            })
+    return items
+
+
+def fetch_genai_prices(src):
+    """pydantic/genai-prices v2 → tracked structured-price diff."""
+    data = http_get(src["url"], accept="application/json").json()
+    snapshot = extract_genai_price_snapshot(
+        data, src.get("_model_keywords") or [])
+    state = load_state("genai_prices")
+    validate_price_snapshot("genai-prices", state, snapshot)
+    now = datetime.now(timezone.utc).isoformat()
+    if state:
+        items = diff_genai_price_snapshots(state, snapshot, now)
+    else:
+        items = [{
+            "title": f"[genai-prices] pricing 基线已建立，追踪 {len(snapshot)} 个模型",
+            "url": "https://github.com/pydantic/genai-prices",
+            "published": now,
+            "summary": "聚合价格索引基线；后续只报新模型与结构化价格变化，不替代厂商官方价目",
+        }]
+    save_state("genai_prices", snapshot)
+    return items
 
 
 def fetch_codexradar(src):
@@ -557,6 +701,7 @@ FETCHERS = {
     "yahoo_chart": fetch_yahoo_chart,
     "statuspage": fetch_statuspage,
     "openrouter_prices": fetch_openrouter_prices,
+    "genai_prices": fetch_genai_prices,
     "codexradar": fetch_codexradar,
 }
 
@@ -608,7 +753,7 @@ def main():
         if src.get("queries_from") == "model_keywords":
             src["queries"] = list(dict.fromkeys(
                 (topics_cfg.get("model_keywords") or []) + src.get("queries_extra", [])))
-        if src["type"] == "openrouter_prices":
+        if src["type"] in ("openrouter_prices", "genai_prices"):
             src["_model_keywords"] = topics_cfg.get("model_keywords") or []
         if src.get("delay_before"):  # 同域信源限流（如 Reddit 连续请求 429）
             time.sleep(src["delay_before"])

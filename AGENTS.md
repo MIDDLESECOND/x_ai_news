@@ -54,6 +54,9 @@
 - 无法归入现有悬案、或影响可能大但可信度不足的信号，写入按月分片的 `data/state/claim_inbox/YYYY-MM.jsonl`；月份只是存储与复盘周期，不代表必须新建立案。
 - 无人值守流程不得直接编辑 `config/claims.yaml`。普通外部可点证据只可通过 `scripts/apply_triage.py` 追加；每条自动证据必须是一 URL 一记录，并带 `stance`、`source_item_id` 与 `snapshot_hash`。该入口明确禁止自动立案与自动改 `status`。状态变化和新悬案只能提名，交由人工或专题复核裁决。
 - `reports/dossiers/` 只机械呈现账本已有证据，带 `ledger_ref` 的职业悬案默认跳过；正式 `reports/YYYY-MM-DD-<主题>.md` 不得被自动覆盖。
+- 分类规则回放必须分别执行 Git 基线版本与工作区版本的分类器及 topics 配置，比较历史快照的召回、栏目路由和逐信源差异；不得写入悬案、状态或日报。
+- 故事聚类是确定性、可重建的阅读视图；必须保留每条底层观察的 `source_item_id` 与 `snapshot_hash`，并记录合并原因。聚为同一故事不等于多来源独立证实。
+- genai-prices 与 OpenRouter 都是二级结构化价格索引，只用于发现候选变化；对外结论必须回到厂商原始定价页，且不得将索引元数据变化误报为价格变化。
 - 所有派生写入必须幂等、加锁并原子替换；下游 dossier 或月度复盘失败不得阻断 brief 与私有备份。
 - 最终备份只能在合成、分诊与派生刷新之后由 `scripts/finalize_daily.py` 触发；`data/state/daily_runs/<date>.json` 是本日事务完成回执，只有同目录 `.sync.json` 的回执哈希确认存在才算同步闭环。备份前后产物指纹、目标受管范围与 Git 提交树必须一致；历史日期不得覆盖全局 current 上下文。
 
@@ -79,6 +82,8 @@ python -m unittest discover -s tests
 
 ```bash
 python scripts/build_analysis_context.py
+python scripts/backtest_classification.py --days 14
+python scripts/build_story_clusters.py --date YYYY-MM-DD
 python scripts/build_report_dossiers.py
 python scripts/build_monthly_claim_review.py --month YYYY-MM
 python scripts/finalize_daily.py --date YYYY-MM-DD

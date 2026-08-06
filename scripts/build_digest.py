@@ -137,7 +137,7 @@ def source_collection_metadata(payload):
     return _source_collection_metadata(payload)
 
 
-def classify(payloads, topics_cfg, day, window_days):
+def classify(payloads, topics_cfg, day, window_days, *, deduplicate_urls=True):
     """返回 (sectioned_items, all_hits)。条目须命中模型词或任一主题词才入围。
     带可解析日期且早于窗口的条目跳过（全历史 feed 由此收敛）；
     内容未变的页面快照（changed=false）跳过；
@@ -155,7 +155,7 @@ def classify(payloads, topics_cfg, day, window_days):
     for p in payloads:
         for it in p["items"]:
             url = it.get("url") or ""
-            if not url or url in seen_urls:
+            if not url or (deduplicate_urls and url in seen_urls):
                 continue
             if it.get("changed") is False:  # 页面快照无变化，不进简报
                 continue
@@ -171,7 +171,8 @@ def classify(payloads, topics_cfg, day, window_days):
                     topic_scores[tname] = (len(hits), tcfg.get("section"), hits)
             if not model_hits and not topic_scores:
                 continue
-            seen_urls.add(url)
+            if deduplicate_urls:
+                seen_urls.add(url)
             # 归栏：得分最高的主题；只命中模型词时按信源层级兜底
             section = None
             if topic_scores:

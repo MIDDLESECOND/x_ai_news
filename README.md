@@ -12,7 +12,7 @@
 python scripts/fetch_l1.py && python scripts/build_digest.py
 ```
 
-产出 `briefs/YYYY-MM-DD.md`，七个栏目：今日发布／一线实测／定价与额度变动／降智观察／公司动态／悬案更新／新信源候选。全部信源为免登录公开端点（27 个：AINews、HN Algolia、Reddit RSS、Hugging Face API、厂商官网与定价页、服务状态页 JSON、OpenRouter 牌价（跨日 diff 只报变动）、Yahoo 行情、CodexRadar 降智雷达（IQ 序列追踪；其数据仅私有研究引用）、Aider 排行榜、llama.cpp Releases 等），配置在 [config/sources.yaml](config/sources.yaml)，单信源失败不影响整体。
+产出 `briefs/YYYY-MM-DD.md`，七个栏目：今日发布／一线实测／定价与额度变动／降智观察／公司动态／悬案更新／新信源候选。全部信源为免登录公开端点（35 个已启用：AINews、HN Algolia、Reddit RSS、Hugging Face API、厂商官网与定价页、服务状态页 JSON、OpenRouter 与 genai-prices 结构化牌价索引、Yahoo 行情、CodexRadar 降智雷达（IQ 序列追踪；其数据仅私有研究引用）、Aider 排行榜、llama.cpp Releases 等），配置在 [config/sources.yaml](config/sources.yaml)，单信源失败不影响整体。结构化牌价索引只用于发现变化，正式判断仍回到厂商原始定价页。
 
 日报合成不会把整个历史账本反复送入 LLM。`build_analysis_context.py` 生成一个有大小上限的当前视图：全部未决悬案只保留目录，高精度命中的悬案才展开证据；仅实体词命中的项目单列为人工候选。弱信号进入按月分片的私有候选箱，正式立案与改判保持人工控制。
 
@@ -63,6 +63,20 @@ Thorsten Ball 登记为低频轮换；Chip Huyen、Gwern、Colah 只保留历史
 运行、构建或评测的文章才进“一线实测”，否则归影子“技术综述/研究解读”。Eugene Yan
 与 Anthropic、Jason Liu 与 OpenAI Codex 的现任关系在配置和报告中单列；涉及本公司产品时
 标记利益关系，但不自动否定其一线信息价值。
+
+### 规则回放与故事派生
+
+分类规则改动前，可对真实历史快照回放 `HEAD` 版本的分类器与 topics 配置，并和工作区版本比较；输出只比较召回、栏目路由和逐信源变化，不写悬案：
+
+```bash
+python scripts/backtest_classification.py --days 14
+```
+
+确定性故事聚类保留每条来源观察的 `source_item_id` 与 `snapshot_hash`，并另外生成合并日志。它是可重建的阅读视图，多来源聚在一起不等于独立证实：
+
+```bash
+python scripts/build_story_clusters.py --date YYYY-MM-DD
+```
 
 ### Windows 定时（Task Scheduler）
 
