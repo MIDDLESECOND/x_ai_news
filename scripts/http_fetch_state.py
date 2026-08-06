@@ -35,6 +35,8 @@ DEFAULT_POLICY = {
     "failure_max_minutes": 12 * 60,
     "max_stale_minutes": 12 * 60,
     "max_body_bytes": 15 * 1024 * 1024,
+    # Hard transport ceiling, enforced while reading decoded response chunks.
+    "max_download_bytes": 15 * 1024 * 1024,
 }
 
 
@@ -141,8 +143,10 @@ def resolve_policy(source: dict | None = None) -> dict:
     policy.update((source or {}).get("fetch_policy") or {})
     for key in ("min_interval_minutes", "max_interval_minutes",
                 "failure_base_minutes", "failure_max_minutes",
-                "max_stale_minutes", "max_body_bytes"):
+                "max_stale_minutes", "max_body_bytes", "max_download_bytes"):
         policy[key] = max(0, int(policy[key]))
+    policy["max_download_bytes"] = min(
+        DEFAULT_POLICY["max_download_bytes"], policy["max_download_bytes"])
     policy["max_interval_minutes"] = max(
         policy["min_interval_minutes"], policy["max_interval_minutes"])
     policy["failure_max_minutes"] = max(

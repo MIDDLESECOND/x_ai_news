@@ -27,7 +27,8 @@ import yaml
 from http_fetch_state import (FetchCooldown, discard_cached_response,
                               host_cooldown, host_lease_key, prepare_request,
                               prune_cache, record_failure, record_host_cooldown,
-                              request_lease, retry_after_seconds, store_success)
+                              request_lease, resolve_policy,
+                              retry_after_seconds, store_success)
 from reddit_rate_limit import is_reddit_url, reserve_request
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -105,6 +106,18 @@ class ResponseValidationError(requests.RequestException):
     """A nominally successful response is not parseable as the requested format."""
 
 
+class ResponseTooLarge(requests.RequestException):
+    """A response exceeded the configured decoded-body transport ceiling."""
+
+
+def close_response(response):
+    """Release a streamed response, tolerating test/custom adapters without raw."""
+    try:
+        response.close()
+    except (AttributeError, OSError):
+        pass
+
+
 def validate_http_response(response, response_kind):
     if response_kind == "json":
         try:
@@ -118,6 +131,52 @@ def validate_http_response(response, response_kind):
             raise ResponseValidationError("HTTP 200 正文不是有效 XML") from error
 
 
+def materialize_response_body(response, max_bytes):
+    """Read a streamed response into memory without ever crossing *max_bytes*."""
+    limit = max(0, int(max_bytes))
+    preloaded = getattr(response, "_content", False)
+    if not isinstance(response, requests.Response):
+        candidate = getattr(response, "content", b"")
+        preloaded = candidate if isinstance(candidate, (bytes, bytearray)) else preloaded
+    if isinstance(preloaded, (bytes, bytearray)):
+        body = bytes(preloaded)
+        if len(body) > limit:
+            close_response(response)
+            raise ResponseTooLarge(
+                f"响应正文 {len(body)} 字节超过上限 {limit} 字节",
+                response=response)
+        response._content = body
+        return response
+
+    declared = response.headers.get("Content-Length")
+    try:
+        declared_size = int(declared) if declared is not None else None
+    except (TypeError, ValueError):
+        declared_size = None
+    if declared_size is not None and declared_size > limit:
+        close_response(response)
+        raise ResponseTooLarge(
+            f"Content-Length {declared_size} 字节超过上限 {limit} 字节",
+            response=response)
+
+    chunks = []
+    total = 0
+    try:
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > limit:
+                raise ResponseTooLarge(
+                    f"流式正文超过上限 {limit} 字节", response=response)
+            chunks.append(chunk)
+        response._content = b"".join(chunks)
+        response._content_consumed = True
+        return response
+    finally:
+        close_response(response)
+
+
 def http_get(url, accept=None, *, source=None, cache_root=None, now=None,
              logical_day=None, force_revalidate=None, response_kind=None):
     """GET with persistent validators, bounded freshness reuse, and hard Reddit gate.
@@ -127,6 +186,7 @@ def http_get(url, accept=None, *, source=None, cache_root=None, now=None,
     ``reserve_request``; a cache hit performs no Reddit request and consumes no slot.
     """
     cache_root = Path(cache_root) if cache_root is not None else HTTP_CACHE_ROOT
+    max_download_bytes = resolve_policy(source)["max_download_bytes"]
     force_revalidate = (HTTP_FORCE_REVALIDATE if force_revalidate is None
                         else force_revalidate)
     logical_day = logical_day or HTTP_LOGICAL_DAY
@@ -136,7 +196,8 @@ def http_get(url, accept=None, *, source=None, cache_root=None, now=None,
     }
     prepared = prepare_request(cache_root, url, accept, **prepare_kwargs)
     ready = _prepared_response(
-        url, prepared, cache_root, now, logical_day, response_kind)
+        url, prepared, cache_root, now, logical_day, response_kind,
+        max_download_bytes)
     if ready is not None:
         return ready
     try:
@@ -149,7 +210,8 @@ def http_get(url, accept=None, *, source=None, cache_root=None, now=None,
                 refreshed_kwargs["force_revalidate"] = False
             prepared = prepare_request(cache_root, url, accept, **refreshed_kwargs)
             ready = _prepared_response(
-                url, prepared, cache_root, now, logical_day, response_kind)
+                url, prepared, cache_root, now, logical_day, response_kind,
+                max_download_bytes)
             if ready is not None:
                 return ready
             return _network_http_get(
@@ -165,11 +227,14 @@ def http_get(url, accept=None, *, source=None, cache_root=None, now=None,
         raise
 
 
-def _prepared_response(url, prepared, cache_root, now, logical_day, response_kind):
+def _prepared_response(url, prepared, cache_root, now, logical_day, response_kind,
+                       max_download_bytes):
     if prepared.cached_response is not None:
         try:
+            materialize_response_body(
+                prepared.cached_response, max_download_bytes)
             validate_http_response(prepared.cached_response, response_kind)
-        except ResponseValidationError as error:
+        except (ResponseValidationError, ResponseTooLarge) as error:
             discard_cached_response(
                 cache_root, prepared, now=now, logical_day=logical_day,
                 error=f"{type(error).__name__}: {error}")
@@ -216,6 +281,7 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
     retry_after_waited = 0
     resp = None
     retried_429 = False
+    max_download_bytes = resolve_policy(source)["max_download_bytes"]
 
     delay_before = max(0.0, float((source or {}).get("delay_before") or 0))
     if delay_before and not is_reddit_url(url):
@@ -242,7 +308,7 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
                 attempts += 1
                 return requests.get(
                     request_url, headers=request_headers, timeout=TIMEOUT,
-                    allow_redirects=False)
+                    allow_redirects=False, stream=True)
 
             try:
                 response = gated_request()
@@ -255,6 +321,7 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
                 retry_after_observed = max(retry_after_observed, wait)
                 retried_429 = True
                 if wait <= 60:
+                    close_response(response)
                     _sleep_with_lease_heartbeat(wait, key_lease, host_lease)
                     retry_after_waited += wait
                     response = gated_request()
@@ -286,13 +353,16 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
                 response.history = history
                 return response
             if not location:
+                close_response(response)
                 raise requests.HTTPError(
                     f"重定向响应缺少 Location：{current_url}", response=response)
             if redirect_count >= 5:
+                close_response(response)
                 raise requests.TooManyRedirects(
                     f"重定向超过 5 跳：{url}", response=response)
             history.append(response)
             current_url = urljoin(response.url or current_url, location)
+            close_response(response)
             if urlsplit(current_url).scheme.lower() not in {"http", "https"}:
                 raise requests.InvalidURL(f"不支持的重定向目标：{current_url}")
             # Validators describe the original selected representation and must
@@ -305,9 +375,11 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
         resp = request_chain(url, headers)
         # 元数据尚在但不可变 body 被清理时，304 无法还原响应；只在这种损坏场景无条件补取一次。
         if resp.status_code == 304:
+            not_modified = resp
             restored = store_success(
                 cache_root, prepared, resp, source=source, now=now,
                 logical_day=logical_day)
+            close_response(not_modified)
             if restored is None:
                 headers.pop("If-None-Match", None)
                 headers.pop("If-Modified-Since", None)
@@ -316,6 +388,7 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
                 resp = restored
         if getattr(resp, "frontier_cache_status", "") != "revalidated":
             resp.raise_for_status()
+            materialize_response_body(resp, max_download_bytes)
             try:
                 validate_http_response(resp, response_kind)
             except ResponseValidationError as error:
@@ -328,7 +401,15 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
                 logical_day=logical_day)
         else:
             try:
+                materialize_response_body(resp, max_download_bytes)
                 validate_http_response(resp, response_kind)
+            except ResponseTooLarge as error:
+                # A 304 proves the oversized cached representation is unchanged;
+                # an unconditional second download would only waste bandwidth.
+                discard_cached_response(
+                    cache_root, prepared, now=now, logical_day=logical_day,
+                    error=f"{type(error).__name__}: {error}")
+                raise
             except ResponseValidationError as error:
                 discard_cached_response(
                     cache_root, prepared, now=now, logical_day=logical_day,
@@ -337,6 +418,7 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
                 headers.pop("If-Modified-Since", None)
                 resp = request_chain(url, headers)
                 resp.raise_for_status()
+                materialize_response_body(resp, max_download_bytes)
                 validate_http_response(resp, response_kind)
                 resp = store_success(
                     cache_root, prepared, resp, source=source, now=now,
@@ -354,10 +436,21 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
     except Exception as error:
         status_code = getattr(resp, "status_code", None)
         validation_error = isinstance(error, ResponseValidationError)
-        retryable = (validation_error or status_code is None or status_code in {
+        oversized = isinstance(error, ResponseTooLarge)
+        transport_error = isinstance(error, (
+            requests.ConnectionError, requests.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.ContentDecodingError))
+        if oversized:
+            discard_cached_response(
+                cache_root, prepared, now=now, logical_day=logical_day,
+                error=f"{type(error).__name__}: {error}")
+        retryable = (validation_error or oversized or transport_error
+                     or status_code is None or status_code in {
             408, 425, 429, 500, 502, 503, 504})
-        allow_stale = (not validation_error and (
-            status_code is None or status_code in {500, 502, 503, 504}))
+        allow_stale = (not validation_error and not oversized and (
+            transport_error or status_code is None
+            or status_code in {500, 502, 503, 504}))
         retry_after = max(
             retry_after_observed,
             (retry_after_waited
@@ -373,6 +466,8 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
             "url": url, "cache_status": "error",
             "network_attempts": attempts, "error": type(error).__name__,
         })
+        if resp is not None:
+            close_response(resp)
         raise
 
 

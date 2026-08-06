@@ -43,6 +43,18 @@ class HttpGetTest(unittest.TestCase):
         response.raise_for_status.return_value = None
         return response
 
+    @staticmethod
+    def streamed_response(chunks, *, status=200, headers=None, url=None):
+        response = requests.Response()
+        response.status_code = status
+        response.url = url or "https://stream.example/feed"
+        response.headers.update(headers or {})
+        response._content = False
+        response._content_consumed = False
+        response.iter_content = Mock(return_value=iter(chunks))
+        response.close = Mock()
+        return response
+
     def test_reddit_request_reserves_shared_rate_limit_slot(self):
         response = self.response()
         with patch.object(fl, "reserve_request") as reserve:
@@ -295,6 +307,103 @@ class HttpGetTest(unittest.TestCase):
         get.assert_called_once()
         self.assertEqual(response.json(), {"ok": True})
 
+    def test_content_length_over_download_cap_is_rejected_before_read(self):
+        url = "https://stream.example/declared-large"
+        response = self.streamed_response(
+            [b"should-not-read"], headers={"Content-Length": "101"}, url=url)
+        source = {"id": "bounded", "fetch_policy": {"max_download_bytes": 100}}
+        with patch.object(fl.requests, "get", return_value=response) as get:
+            with self.assertRaises(fl.ResponseTooLarge):
+                self.get(url, source=source)
+
+        response.iter_content.assert_not_called()
+        response.close.assert_called()
+        self.assertTrue(get.call_args.kwargs["stream"])
+        entry = load_entry(self.cache_root, request_key(url, source_id="bounded"))
+        self.assertFalse(entry.get("body_sha256"))
+        self.assertTrue(entry.get("retry_at"))
+
+    def test_download_cap_can_tighten_but_not_exceed_hard_default(self):
+        hard_cap = 15 * 1024 * 1024
+        self.assertEqual(fl.resolve_policy({
+            "fetch_policy": {"max_download_bytes": hard_cap * 10},
+        })["max_download_bytes"], hard_cap)
+        self.assertEqual(fl.resolve_policy({
+            "fetch_policy": {"max_download_bytes": 1024},
+        })["max_download_bytes"], 1024)
+
+    def test_chunked_body_is_stopped_when_decoded_bytes_cross_cap(self):
+        url = "https://stream.example/chunked-large"
+        response = self.streamed_response([b"a" * 60, b"b" * 41], url=url)
+        source = {"id": "bounded", "fetch_policy": {"max_download_bytes": 100}}
+        with patch.object(fl.requests, "get", return_value=response):
+            with self.assertRaises(fl.ResponseTooLarge):
+                self.get(url, source=source)
+
+        response.iter_content.assert_called_once_with(chunk_size=64 * 1024)
+        response.close.assert_called()
+
+    def test_streamed_body_within_cap_is_materialized_and_cached(self):
+        url = "https://stream.example/feed"
+        response = self.streamed_response([b"feed-", b"v1"], url=url)
+        source = {"id": "bounded", "fetch_policy": {"max_download_bytes": 100}}
+        with patch.object(fl.requests, "get", return_value=response):
+            result = self.get(url, source=source)
+
+        self.assertEqual(result.content, b"feed-v1")
+        response.close.assert_called_once()
+        entry = load_entry(self.cache_root, request_key(url, source_id="bounded"))
+        self.assertTrue(entry.get("body_sha256"))
+
+    def test_stream_decode_failure_remains_retryable_network_failure(self):
+        url = "https://stream.example/broken"
+        response = self.streamed_response([], url=url)
+        response.iter_content.side_effect = requests.exceptions.ChunkedEncodingError("broken")
+        source = {"id": "bounded", "fetch_policy": {"max_download_bytes": 100}}
+        with patch.object(fl.requests, "get", return_value=response):
+            with self.assertRaises(requests.exceptions.ChunkedEncodingError):
+                self.get(url, source=source)
+
+        entry = load_entry(self.cache_root, request_key(url, source_id="bounded"))
+        self.assertTrue(entry.get("retry_at"))
+        self.assertTrue(entry.get("allow_stale"))
+        response.close.assert_called()
+
+    def test_tightened_download_cap_invalidates_larger_fresh_cache(self):
+        url = "https://stream.example/tightened"
+        source = {"id": "bounded", "fetch_policy": {"max_download_bytes": 100}}
+        with patch.object(
+                fl.requests, "get",
+                return_value=self.response(content=b"a" * 80)):
+            self.get(url, source=source)
+
+        tightened = {
+            "id": "bounded", "fetch_policy": {"max_download_bytes": 50}}
+        replacement = self.response(content=b"b" * 40)
+        with patch.object(fl.requests, "get", return_value=replacement) as get:
+            result = self.get(url, source=tightened)
+        get.assert_called_once()
+        self.assertEqual(result.content, b"b" * 40)
+
+    def test_tightened_download_cap_rejects_larger_304_body(self):
+        url = "https://stream.example/tightened-304"
+        source = {"id": "bounded", "fetch_policy": {"max_download_bytes": 100}}
+        with patch.object(
+                fl.requests, "get",
+                return_value=self.response(
+                    content=b"a" * 80, headers={"ETag": '"v1"'})):
+            self.get(url, source=source)
+
+        self.now += timedelta(minutes=31)
+        tightened = {
+            "id": "bounded", "fetch_policy": {"max_download_bytes": 50}}
+        not_modified = self.response(
+            status=304, content=b"", headers={"ETag": '"v1"'})
+        with patch.object(fl.requests, "get", return_value=not_modified) as get:
+            with self.assertRaises(fl.ResponseTooLarge):
+                self.get(url, source=tightened)
+        get.assert_called_once()
+
     def test_redirect_hops_each_pass_through_rate_gate(self):
         start = "https://redirect.example/feed"
         target = "https://www.reddit.com/r/test/.rss"
@@ -309,6 +418,7 @@ class HttpGetTest(unittest.TestCase):
                 response = self.get(start)
 
         self.assertEqual(response.content, b"feed-v1")
+        redirected.close.assert_called_once()
         self.assertEqual(
             [entry.args[0] for entry in reserve.call_args_list], [start, target])
         self.assertEqual(
