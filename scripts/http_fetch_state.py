@@ -324,8 +324,13 @@ def prepare_request(root: Path, url: str, accept: str | None = None, *,
         next_check_at = min(next_check_at, current_cap)
     fresh_until = _parse_time(entry.get("fresh_until"))
     within_http_freshness = fresh_until is None or now < fresh_until
+    has_redirect_memory = bool(entry.get("permanent_redirect_url"))
+    redirect_memory_current = (
+        not has_redirect_memory
+        or usable_permanent_redirect(entry, now=now) is not None)
     if (body_exists and same_day and next_check_at and now < next_check_at
             and within_http_freshness and not _requires_revalidation(entry)
+            and redirect_memory_current
             and not force_revalidate):
         prepared.cached_response = synthetic_response(root, entry, "fresh")
         return prepared
@@ -401,6 +406,20 @@ def _fresh_until(headers, now: datetime) -> str | None:
     seconds = _explicit_freshness_seconds(headers, now)
     return ((now + timedelta(seconds=seconds)).isoformat()
             if seconds is not None else None)
+
+
+def usable_permanent_redirect(entry: dict, *, now: datetime | None = None) -> str | None:
+    """Return an unexpired remembered target, failing closed on bad metadata."""
+    target = entry.get("permanent_redirect_url")
+    if not isinstance(target, str) or not target:
+        return None
+    raw_until = entry.get("permanent_redirect_until")
+    if raw_until is None:
+        return target
+    until = _parse_time(raw_until)
+    if until is None or until <= normalize_now(now):
+        return None
+    return target
 
 
 def _requires_revalidation(entry: dict) -> bool:
@@ -535,6 +554,122 @@ def discard_cached_response(root: Path, prepared: PreparedRequest, *,
     prepared.cached_response = None
 
 
+def _permanent_redirect_deadline(response, now: datetime) -> tuple[bool, str | None]:
+    """Apply redirect response cache directives and return the earliest expiry."""
+    deadlines = []
+    inherited = getattr(
+        response, "frontier_inherited_permanent_redirect_until", None)
+    if not isinstance(inherited, (str, type(None))):
+        inherited = None
+    if inherited is not None:
+        inherited_deadline = _parse_time(inherited)
+        if inherited_deadline is None:
+            return False, None
+        deadlines.append(inherited_deadline)
+
+    for hop in getattr(response, "history", None) or []:
+        directives = _cache_control(getattr(hop, "headers", None))
+        if any(name in directives for name in (
+                "no-store", "no-cache", "must-revalidate",
+                "proxy-revalidate")):
+            return False, None
+        vary = {
+            token.strip().lower()
+            for token in _header(getattr(hop, "headers", None), "Vary").split(",")
+            if token.strip()
+        }
+        if "*" in vary:
+            return False, None
+        valid_freshness, seconds = _redirect_freshness_seconds(
+            getattr(hop, "headers", None), now)
+        if not valid_freshness:
+            return False, None
+        if seconds is not None:
+            deadlines.append(now + timedelta(seconds=seconds))
+
+    if not deadlines:
+        return True, None
+    deadline = min(deadlines)
+    return deadline > now, deadline.isoformat()
+
+
+def _redirect_freshness_seconds(headers, now: datetime) -> tuple[bool, int | None]:
+    """Parse redirect freshness fail-closed and account for apparent age."""
+    cache_control_tokens = [
+        token.strip().partition("=")[0].strip().lower()
+        for token in _header(headers, "Cache-Control").split(",")
+        if token.strip()
+    ]
+    if cache_control_tokens.count("max-age") > 1:
+        return False, None
+    directives = _cache_control(headers)
+    if "max-age" in directives:
+        try:
+            lifetime = max(0, int(directives["max-age"]))
+        except (TypeError, ValueError):
+            return False, None
+        valid_age, age, _ = _redirect_current_age(headers, now)
+        if not valid_age:
+            return False, None
+        return True, max(0, lifetime - age)
+
+    expires = _header(headers, "Expires")
+    if expires:
+        try:
+            deadline = parsedate_to_datetime(expires)
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError, OverflowError):
+            return False, None
+        valid_age, age, served_at = _redirect_current_age(headers, now)
+        if not valid_age:
+            return False, None
+        lifetime = max(0, int(
+            (deadline.astimezone(timezone.utc) - served_at).total_seconds()))
+        return True, max(0, lifetime - age)
+    return True, None
+
+
+def _redirect_current_age(
+        headers, now: datetime) -> tuple[bool, int, datetime]:
+    """Return RFC-style current age and the response Date baseline."""
+    try:
+        age = max(0, int(_header(headers, "Age") or 0))
+    except (TypeError, ValueError):
+        return False, 0, now
+    served_at = now
+    date_value = _header(headers, "Date")
+    if date_value:
+        try:
+            served_at = parsedate_to_datetime(date_value)
+            if served_at.tzinfo is None:
+                served_at = served_at.replace(tzinfo=timezone.utc)
+            served_at = served_at.astimezone(timezone.utc)
+        except (TypeError, ValueError, OverflowError):
+            return False, 0, now
+        apparent_age = max(0, int((now - served_at).total_seconds()))
+        age = max(age, apparent_age)
+    return True, age, served_at
+
+
+def _apply_permanent_redirect(entry: dict, response, *, now: datetime,
+                               enabled=True) -> dict:
+    """Copy a caller-validated, cacheable permanent target into success metadata."""
+    target = getattr(response, "frontier_permanent_redirect_url", None)
+    if not enabled or not isinstance(target, str) or not target:
+        entry.pop("permanent_redirect_url", None)
+        entry.pop("permanent_redirect_until", None)
+        return entry
+    reusable, deadline = _permanent_redirect_deadline(response, now)
+    if reusable:
+        entry["permanent_redirect_url"] = target
+        entry["permanent_redirect_until"] = deadline
+    else:
+        entry.pop("permanent_redirect_url", None)
+        entry.pop("permanent_redirect_until", None)
+    return entry
+
+
 def store_success(root: Path, prepared: PreparedRequest, response,
                   *, source: dict | None = None, now: datetime | None = None,
                   logical_day: str | None = None):
@@ -551,9 +686,11 @@ def store_success(root: Path, prepared: PreparedRequest, response,
         merged_directives = _cache_control(merged_headers)
         if (not policy["enabled"] or "no-store" in merged_directives
                 or _header(merged_headers, "Vary").strip() == "*"):
+            entry = _apply_permanent_redirect(
+                _noncacheable_entry(prepared, now, logical_day), response,
+                now=now, enabled=policy["enabled"])
             _write_entry(
-                root, prepared.key,
-                _noncacheable_entry(prepared, now, logical_day))
+                root, prepared.key, entry)
             cached.frontier_cache_status = "revalidated_no_store"
             cached.frontier_last_network_success_at = now.isoformat()
             return cached
@@ -574,6 +711,8 @@ def store_success(root: Path, prepared: PreparedRequest, response,
             "retry_at": None,
             "allow_stale": False,
         })
+        _apply_permanent_redirect(
+            entry, response, now=now, enabled=policy["enabled"])
         _write_entry(root, prepared.key, entry)
         cached.frontier_last_network_success_at = now.isoformat()
         return cached
@@ -587,9 +726,11 @@ def store_success(root: Path, prepared: PreparedRequest, response,
     if not cacheable:
         # Replace metadata so a prior fresh body cannot survive a later no-store,
         # Vary: *, explicit disable, or body-size rejection decision.
+        entry = _apply_permanent_redirect(
+            _noncacheable_entry(prepared, now, logical_day), response,
+            now=now, enabled=policy["enabled"])
         _write_entry(
-            root, prepared.key,
-            _noncacheable_entry(prepared, now, logical_day))
+            root, prepared.key, entry)
         response.frontier_cache_status = "bypass"
         response.frontier_last_network_success_at = now.isoformat()
         return response
@@ -619,6 +760,8 @@ def store_success(root: Path, prepared: PreparedRequest, response,
         "retry_at": None,
         "allow_stale": False,
     }
+    _apply_permanent_redirect(
+        entry, response, now=now, enabled=policy["enabled"])
     _write_entry(root, prepared.key, entry, body)
     response.frontier_cache_status = (
         "miss" if not old.get("body_sha256") else "updated" if changed else "unchanged")

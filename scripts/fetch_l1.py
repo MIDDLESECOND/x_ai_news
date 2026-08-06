@@ -31,7 +31,8 @@ from http_fetch_state import (FetchCooldown, discard_cached_response,
                               host_cooldown, host_lease_key, prepare_request,
                               prune_cache, record_failure, record_host_cooldown,
                               request_lease, resolve_policy,
-                              retry_after_seconds, store_success)
+                              retry_after_seconds, store_success,
+                              usable_permanent_redirect)
 from reddit_rate_limit import is_reddit_url, reserve_request
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -388,6 +389,23 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
     policy = resolve_policy(source)
     max_download_bytes = policy["max_download_bytes"]
     max_download_seconds = policy["max_download_seconds"]
+    remembered_redirect = (
+        usable_permanent_redirect(prepared.entry, now=now)
+        if policy["enabled"] else None)
+    had_redirect_memory = bool(prepared.entry.get("permanent_redirect_url"))
+    remembered_redirect_until = (
+        prepared.entry.get("permanent_redirect_until")
+        if remembered_redirect is not None else None)
+    if (not isinstance(remembered_redirect, str)
+            or not remembered_redirect
+            or remembered_redirect == url):
+        remembered_redirect = None
+    request_start_url = remembered_redirect or url
+    if had_redirect_memory and remembered_redirect is None:
+        # Validators belong to the remembered target representation, not the
+        # configured origin whose redirect mapping now needs revalidation.
+        headers.pop("If-None-Match", None)
+        headers.pop("If-Modified-Since", None)
 
     delay_before = max(0.0, float((source or {}).get("delay_before") or 0))
     if delay_before and not is_reddit_url(url):
@@ -454,11 +472,11 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
                         error=f"HTTP {response.status_code}")
             return response
 
-    def request_chain(start_url, initial_headers):
+    def request_chain(start_url, initial_headers, *, untrusted_start=False):
         current_url = start_url
         current_headers = dict(initial_headers)
         history = []
-        untrusted_redirect = False
+        untrusted_redirect = untrusted_start
         for redirect_count in range(6):
             response = request_hop(
                 current_url, current_headers,
@@ -466,6 +484,19 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
             location = response.headers.get("Location")
             if response.status_code not in {301, 302, 303, 307, 308}:
                 response.history = history
+                permanent_target = None
+                if history and all(
+                        hop.status_code in {301, 308} for hop in history):
+                    permanent_target = current_url
+                elif untrusted_start:
+                    # A temporary redirect from a remembered permanent target
+                    # does not replace the permanent target itself.
+                    permanent_target = start_url
+                if permanent_target and permanent_target != url:
+                    response.frontier_permanent_redirect_url = permanent_target
+                    if untrusted_start:
+                        response.frontier_inherited_permanent_redirect_until = (
+                            remembered_redirect_until)
                 return response
             if not location:
                 close_response(response)
@@ -486,7 +517,9 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
         raise requests.TooManyRedirects(f"重定向超过 5 跳：{url}")
 
     try:
-        resp = request_chain(url, headers)
+        resp = request_chain(
+            request_start_url, headers,
+            untrusted_start=remembered_redirect is not None)
         # 元数据尚在但不可变 body 被清理时，304 无法还原响应；只在这种损坏场景无条件补取一次。
         if resp.status_code == 304:
             not_modified = resp
@@ -497,7 +530,9 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
             if restored is None:
                 headers.pop("If-None-Match", None)
                 headers.pop("If-Modified-Since", None)
-                resp = request_chain(url, headers)
+                resp = request_chain(
+                    request_start_url, headers,
+                    untrusted_start=remembered_redirect is not None)
             else:
                 resp = restored
         if getattr(resp, "frontier_cache_status", "") != "revalidated":
@@ -532,7 +567,9 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
                     error=f"{type(error).__name__}: {error}")
                 headers.pop("If-None-Match", None)
                 headers.pop("If-Modified-Since", None)
-                resp = request_chain(url, headers)
+                resp = request_chain(
+                    request_start_url, headers,
+                    untrusted_start=remembered_redirect is not None)
                 resp.raise_for_status()
                 materialize_response_body(
                     resp, max_download_bytes, max_download_seconds)
@@ -559,6 +596,12 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
             requests.ConnectionError, requests.Timeout,
             requests.exceptions.ChunkedEncodingError,
             requests.exceptions.ContentDecodingError))
+        if remembered_redirect is not None:
+            # Any real failure at a remembered target makes the optimization
+            # self-heal: after the normal cooldown, retry the configured URL.
+            prepared.entry = dict(prepared.entry)
+            prepared.entry.pop("permanent_redirect_url", None)
+            prepared.entry.pop("permanent_redirect_until", None)
         if oversized or unsafe_redirect:
             discard_cached_response(
                 cache_root, prepared, now=now, logical_day=logical_day,

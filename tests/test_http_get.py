@@ -560,6 +560,413 @@ class HttpGetTest(unittest.TestCase):
             reserve.call_args_list,
             [call(start, sleep_fn=ANY), call(target, sleep_fn=ANY)])
 
+    def test_permanent_redirect_is_remembered_and_revalidated_directly(self):
+        start = "https://old.example/feed"
+        target = "https://new.example/feed"
+        moved = self.response(
+            status=301, content=b"", headers={"Location": target})
+        moved.url = start
+        final = self.response(headers={"ETag": '"v1"'})
+        final.url = target
+        public_dns = self.dns_answers("93.184.216.34")
+        with patch.object(fl.socket, "getaddrinfo", return_value=public_dns):
+            with patch.object(
+                    fl.requests, "get", side_effect=[moved, final]):
+                self.get(start)
+
+        entry = load_entry(self.cache_root, request_key(start))
+        self.assertEqual(entry.get("permanent_redirect_url"), target)
+
+        not_modified = self.response(
+            status=304, content=b"", headers={"ETag": '"v1"'})
+        not_modified.url = target
+        with patch.object(fl.socket, "getaddrinfo", return_value=public_dns):
+            with patch.object(
+                    fl.requests, "get", return_value=not_modified) as get:
+                response = self.get(start, force_revalidate=True)
+
+        get.assert_called_once()
+        self.assertEqual(get.call_args.args[0], target)
+        self.assertEqual(
+            get.call_args.kwargs["headers"].get("If-None-Match"), '"v1"')
+        self.assertEqual(response.content, b"feed-v1")
+        entry = load_entry(self.cache_root, request_key(start))
+        self.assertEqual(entry.get("permanent_redirect_url"), target)
+
+    def test_temporary_redirect_is_not_remembered(self):
+        start = "https://old.example/feed"
+        target = "https://temporary.example/feed"
+        moved = self.response(
+            status=302, content=b"", headers={"Location": target})
+        moved.url = start
+        final = self.response()
+        final.url = target
+        with patch.object(
+                fl.socket, "getaddrinfo",
+                return_value=self.dns_answers("93.184.216.34")):
+            with patch.object(
+                    fl.requests, "get", side_effect=[moved, final]):
+                self.get(start)
+
+        entry = load_entry(self.cache_root, request_key(start))
+        self.assertNotIn("permanent_redirect_url", entry)
+
+    def test_mixed_permanent_and_temporary_chain_is_not_remembered(self):
+        start = "https://old.example/feed"
+        intermediate = "https://moved.example/feed"
+        target = "https://temporary.example/feed"
+        permanent = self.response(
+            status=301, content=b"", headers={"Location": intermediate})
+        permanent.url = start
+        temporary = self.response(
+            status=302, content=b"", headers={"Location": target})
+        temporary.url = intermediate
+        final = self.response()
+        final.url = target
+        with patch.object(
+                fl.socket, "getaddrinfo",
+                return_value=self.dns_answers("93.184.216.34")):
+            with patch.object(
+                    fl.requests, "get",
+                    side_effect=[permanent, temporary, final]):
+                self.get(start)
+
+        entry = load_entry(self.cache_root, request_key(start))
+        self.assertNotIn("permanent_redirect_url", entry)
+
+    def test_redirect_cache_directives_can_forbid_memory(self):
+        cases = {
+            "no-store": {"Cache-Control": "no-store"},
+            "no-cache": {"Cache-Control": "no-cache"},
+            "must-revalidate": {"Cache-Control": "must-revalidate"},
+            "proxy-revalidate": {"Cache-Control": "proxy-revalidate"},
+            "vary-star": {"Vary": "*"},
+            "invalid-max-age": {"Cache-Control": "max-age=bogus"},
+            "duplicate-max-age": {
+                "Cache-Control": "max-age=0, max-age=3600"},
+            "invalid-expires": {"Expires": "0"},
+            "expires-invalid-age": {
+                "Expires": "Thu, 06 Aug 2026 13:00:00 GMT",
+                "Age": "bogus",
+            },
+            "expires-invalid-date": {
+                "Expires": "Thu, 06 Aug 2026 13:00:00 GMT",
+                "Date": "not-a-date",
+            },
+            "already-aged": {
+                "Cache-Control": "max-age=60",
+                "Date": "Thu, 06 Aug 2026 11:58:00 GMT",
+            },
+        }
+        for label, redirect_headers in cases.items():
+            with self.subTest(label=label):
+                start = f"https://old.example/{label}"
+                target = f"https://new.example/{label}"
+                moved = self.response(
+                    status=301, content=b"",
+                    headers={"Location": target, **redirect_headers})
+                moved.url = start
+                final = self.response()
+                final.url = target
+                with patch.object(
+                        fl.socket, "getaddrinfo",
+                        return_value=self.dns_answers("93.184.216.34")):
+                    with patch.object(
+                            fl.requests, "get", side_effect=[moved, final]):
+                        self.get(start)
+
+                entry = load_entry(self.cache_root, request_key(start))
+                self.assertNotIn("permanent_redirect_url", entry)
+                self.assertNotIn("permanent_redirect_until", entry)
+
+    def test_redirect_deadline_is_not_extended_by_target_success(self):
+        start = "https://old.example/expiring"
+        target = "https://new.example/expiring"
+        moved = self.response(
+            status=301, content=b"", headers={
+                "Location": target, "Cache-Control": "max-age=60",
+                "Age": "10"})
+        moved.url = start
+        final = self.response()
+        final.url = target
+        public_dns = self.dns_answers("93.184.216.34")
+        with patch.object(fl.socket, "getaddrinfo", return_value=public_dns):
+            with patch.object(
+                    fl.requests, "get", side_effect=[moved, final]):
+                self.get(start)
+
+        first_entry = load_entry(self.cache_root, request_key(start))
+        deadline = first_entry.get("permanent_redirect_until")
+        self.assertEqual(
+            deadline, (self.now + timedelta(seconds=50)).isoformat())
+
+        self.now += timedelta(seconds=30)
+        direct = self.response(content=b"updated", headers={"ETag": '"v2"'})
+        direct.url = target
+        with patch.object(fl.socket, "getaddrinfo", return_value=public_dns):
+            with patch.object(fl.requests, "get", return_value=direct) as get:
+                self.get(start, force_revalidate=True)
+        self.assertEqual(get.call_args.args[0], target)
+        entry = load_entry(self.cache_root, request_key(start))
+        self.assertEqual(entry.get("permanent_redirect_until"), deadline)
+
+        self.now += timedelta(seconds=21)
+        replacement = self.response(content=b"configured-origin")
+        replacement.url = start
+        with patch.object(fl.requests, "get", return_value=replacement) as get:
+            self.get(start)
+        self.assertEqual(get.call_args.args[0], start)
+        self.assertNotIn("If-None-Match", get.call_args.kwargs["headers"])
+        entry = load_entry(self.cache_root, request_key(start))
+        self.assertNotIn("permanent_redirect_url", entry)
+
+    def test_redirect_expires_header_returns_to_configured_url(self):
+        start = "https://old.example/expires"
+        target = "https://new.example/expires"
+        moved = self.response(
+            status=308, content=b"", headers={
+                "Location": target,
+                "Expires": "Thu, 06 Aug 2026 12:01:00 GMT",
+            })
+        moved.url = start
+        final = self.response()
+        final.url = target
+        with patch.object(
+                fl.socket, "getaddrinfo",
+                return_value=self.dns_answers("93.184.216.34")):
+            with patch.object(
+                    fl.requests, "get", side_effect=[moved, final]):
+                self.get(start)
+
+        self.now += timedelta(seconds=61)
+        replacement = self.response(content=b"configured-origin")
+        replacement.url = start
+        with patch.object(fl.requests, "get", return_value=replacement) as get:
+            self.get(start)
+        self.assertEqual(get.call_args.args[0], start)
+
+    def test_redirect_expires_accounts_for_age_and_date(self):
+        self.now += timedelta(minutes=10)
+        start = "https://old.example/aged-expires"
+        target = "https://new.example/aged-expires"
+        moved = self.response(
+            status=301, content=b"", headers={
+                "Location": target,
+                "Date": "Thu, 06 Aug 2026 12:00:00 GMT",
+                "Expires": "Thu, 06 Aug 2026 13:00:00 GMT",
+                "Age": "1800",
+            })
+        moved.url = start
+        final = self.response()
+        final.url = target
+        with patch.object(
+                fl.socket, "getaddrinfo",
+                return_value=self.dns_answers("93.184.216.34")):
+            with patch.object(
+                    fl.requests, "get", side_effect=[moved, final]):
+                self.get(start)
+
+        entry = load_entry(self.cache_root, request_key(start))
+        self.assertEqual(
+            entry.get("permanent_redirect_until"),
+            (self.now + timedelta(minutes=30)).isoformat())
+
+    def test_permanent_redirect_chain_uses_earliest_deadline(self):
+        start = "https://old.example/chain"
+        intermediate = "https://middle.example/chain"
+        target = "https://new.example/chain"
+        first = self.response(
+            status=301, content=b"", headers={
+                "Location": intermediate, "Cache-Control": "max-age=120"})
+        first.url = start
+        second = self.response(
+            status=308, content=b"", headers={
+                "Location": target, "Cache-Control": "max-age=60"})
+        second.url = intermediate
+        final = self.response()
+        final.url = target
+        with patch.object(
+                fl.socket, "getaddrinfo",
+                return_value=self.dns_answers("93.184.216.34")):
+            with patch.object(
+                    fl.requests, "get", side_effect=[first, second, final]):
+                self.get(start)
+
+        entry = load_entry(self.cache_root, request_key(start))
+        self.assertEqual(entry.get("permanent_redirect_url"), target)
+        self.assertEqual(
+            entry.get("permanent_redirect_until"),
+            (self.now + timedelta(seconds=60)).isoformat())
+
+    def test_remembered_target_permanent_move_inherits_earliest_deadline(self):
+        start = "https://old.example/inherited-chain"
+        remembered = "https://middle.example/inherited-chain"
+        target = "https://new.example/inherited-chain"
+        first = self.response(
+            status=301, content=b"", headers={
+                "Location": remembered, "Cache-Control": "max-age=60"})
+        first.url = start
+        initial_final = self.response()
+        initial_final.url = remembered
+        public_dns = self.dns_answers("93.184.216.34")
+        with patch.object(fl.socket, "getaddrinfo", return_value=public_dns):
+            with patch.object(
+                    fl.requests, "get", side_effect=[first, initial_final]):
+                self.get(start)
+        inherited_deadline = load_entry(
+            self.cache_root, request_key(start)).get(
+                "permanent_redirect_until")
+
+        self.now += timedelta(seconds=30)
+        moved_again = self.response(
+            status=308, content=b"", headers={
+                "Location": target, "Cache-Control": "max-age=120"})
+        moved_again.url = remembered
+        final = self.response(content=b"new-target")
+        final.url = target
+        with patch.object(fl.socket, "getaddrinfo", return_value=public_dns):
+            with patch.object(
+                    fl.requests, "get",
+                    side_effect=[moved_again, final]) as get:
+                self.get(start, force_revalidate=True)
+
+        self.assertEqual(get.call_args_list[0].args[0], remembered)
+        entry = load_entry(self.cache_root, request_key(start))
+        self.assertEqual(entry.get("permanent_redirect_url"), target)
+        self.assertEqual(
+            entry.get("permanent_redirect_until"), inherited_deadline)
+
+    def test_remembered_target_temporary_move_does_not_replace_it(self):
+        start = "https://old.example/temporary-chain"
+        remembered = "https://middle.example/temporary-chain"
+        temporary = "https://temporary.example/temporary-chain"
+        first = self.response(
+            status=301, content=b"", headers={"Location": remembered})
+        first.url = start
+        initial_final = self.response()
+        initial_final.url = remembered
+        public_dns = self.dns_answers("93.184.216.34")
+        with patch.object(fl.socket, "getaddrinfo", return_value=public_dns):
+            with patch.object(
+                    fl.requests, "get", side_effect=[first, initial_final]):
+                self.get(start)
+
+        temporary_move = self.response(
+            status=302, content=b"", headers={"Location": temporary})
+        temporary_move.url = remembered
+        final = self.response(content=b"temporary-target")
+        final.url = temporary
+        with patch.object(fl.socket, "getaddrinfo", return_value=public_dns):
+            with patch.object(
+                    fl.requests, "get",
+                    side_effect=[temporary_move, final]):
+                self.get(start, force_revalidate=True)
+
+        entry = load_entry(self.cache_root, request_key(start))
+        self.assertEqual(entry.get("permanent_redirect_url"), remembered)
+        self.assertIsNone(entry.get("permanent_redirect_until"))
+
+    def test_permanent_redirect_memory_respects_disabled_http_state(self):
+        start = "https://old.example/feed"
+        target = "https://new.example/feed"
+        source = {"id": "disabled", "fetch_policy": {"enabled": False}}
+        moved = self.response(
+            status=301, content=b"", headers={"Location": target})
+        moved.url = start
+        final = self.response()
+        final.url = target
+        with patch.object(
+                fl.socket, "getaddrinfo",
+                return_value=self.dns_answers("93.184.216.34")):
+            with patch.object(
+                    fl.requests, "get", side_effect=[moved, final]):
+                self.get(start, source=source)
+
+        entry = load_entry(
+            self.cache_root, request_key(start, source_id="disabled"))
+        self.assertNotIn("permanent_redirect_url", entry)
+
+    def test_permanent_redirect_survives_no_store_without_caching_body(self):
+        start = "https://old.example/no-store"
+        target = "https://new.example/no-store"
+        moved = self.response(
+            status=301, content=b"", headers={"Location": target})
+        moved.url = start
+        final = self.response(headers={"Cache-Control": "no-store"})
+        final.url = target
+        public_dns = self.dns_answers("93.184.216.34")
+        with patch.object(fl.socket, "getaddrinfo", return_value=public_dns):
+            with patch.object(
+                    fl.requests, "get", side_effect=[moved, final]):
+                self.get(start)
+
+        entry = load_entry(self.cache_root, request_key(start))
+        self.assertEqual(entry.get("permanent_redirect_url"), target)
+        self.assertFalse(entry.get("body_sha256"))
+
+        replacement = self.response(headers={"Cache-Control": "no-store"})
+        replacement.url = target
+        with patch.object(fl.socket, "getaddrinfo", return_value=public_dns):
+            with patch.object(
+                    fl.requests, "get", return_value=replacement) as get:
+                self.get(start)
+        self.assertEqual(get.call_args.args[0], target)
+
+    def test_remembered_redirect_is_revalidated_as_untrusted(self):
+        start = "https://old.example/feed"
+        target = "https://moved.example/feed"
+        moved = self.response(
+            status=301, content=b"", headers={"Location": target})
+        moved.url = start
+        final = self.response(headers={"ETag": '"v1"'})
+        final.url = target
+        with patch.object(
+                fl.socket, "getaddrinfo",
+                return_value=self.dns_answers("93.184.216.34")):
+            with patch.object(
+                    fl.requests, "get", side_effect=[moved, final]):
+                self.get(start)
+
+        with patch.object(
+                fl.socket, "getaddrinfo",
+                return_value=self.dns_answers("127.0.0.1")):
+            with patch.object(fl.requests, "get") as get:
+                with self.assertRaises(fl.UnsafeRedirectTarget):
+                    self.get(start, force_revalidate=True)
+
+        get.assert_not_called()
+        entry = load_entry(self.cache_root, request_key(start))
+        self.assertNotIn("permanent_redirect_url", entry)
+        self.assertFalse(entry.get("allow_stale"))
+
+    def test_failed_remembered_redirect_is_cleared_for_next_run(self):
+        start = "https://old.example/feed"
+        target = "https://failed.example/feed"
+        moved = self.response(
+            status=308, content=b"", headers={"Location": target})
+        moved.url = start
+        final = self.response(headers={"ETag": '"v1"'})
+        final.url = target
+        public_dns = self.dns_answers("93.184.216.34")
+        with patch.object(fl.socket, "getaddrinfo", return_value=public_dns):
+            with patch.object(
+                    fl.requests, "get", side_effect=[moved, final]):
+                self.get(start)
+
+        failed = requests.Response()
+        failed.status_code = 404
+        failed.url = target
+        failed._content = b"gone"
+        with patch.object(fl.socket, "getaddrinfo", return_value=public_dns):
+            with patch.object(fl.requests, "get", return_value=failed) as get:
+                with self.assertRaises(requests.HTTPError):
+                    self.get(start, force_revalidate=True)
+
+        self.assertEqual(get.call_args.args[0], target)
+        entry = load_entry(self.cache_root, request_key(start))
+        self.assertNotIn("permanent_redirect_url", entry)
+        self.assertNotIn("permanent_redirect_until", entry)
+
     def test_redirect_to_literal_private_address_is_blocked_before_request(self):
         start = "https://redirect.example/feed"
         target = "http://169.254.169.254/latest/meta-data"
