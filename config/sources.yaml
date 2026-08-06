@@ -92,6 +92,13 @@ sources:
     tier: official
     enabled: true
 
+  - id: demis_hassabis_substack
+    name: Demis Hassabis Substack
+    type: rss                 # 具名一手观点；低频高信号，仍按厂商口径处理
+    url: https://demishassabis.substack.com/feed
+    tier: official
+    enabled: true
+
   - id: anthropic_blog
     name: Anthropic News
     type: html_stub          # 官方无 RSS（/rss.xml 404，验证于 2026-08-01）
