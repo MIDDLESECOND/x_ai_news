@@ -21,6 +21,49 @@ python scripts/fetch_l1.py && python scripts/build_digest.py
 - `--keep-days N`（fetch_l1）：`data/raw` 自动保留最近 N 天（默认 45）。
 - 无 RSS 的站点用页面快照 + 跨日内容哈希比对（`data/state/html_snapshots.json`），只有内容变化时才进简报。
 
+### Reddit 信源影子审计
+
+候选 subreddit 不直接加入正式日报。独立审计脚本按 `config/reddit_audit.yaml` 中的
+研究、Agent、MLOps、运行时、模态和泛 AI 对照组采集 `/new/.rss`，累计 14 个完整采样日比较
+活跃度、技术/证据文本代理、直接证据链接、跨社区重复、噪声，以及相对现有非 Reddit
+L1 的领先时间：
+
+```bash
+python scripts/audit_reddit_sources.py
+```
+
+原始样本写入 `data/reddit_audit/`，日报之外的阶段报告写入
+`reports/reddit-source-audit/`；二者均为私有层。电脑关机造成的自然日空档不丢样本，最终
+报告始终读取最近 14 个完整采样日。未满 14 天只显示临时排名，不会自动修改
+`config/sources.yaml`。若当天只需重算报告，可加 `--report-only`。
+
+其他日报分区使用同一套影子晋退逻辑，但按栏目采用不同质量指标：发布看官方确认与
+模型卡/权重，实测看方法学与复现材料，定价看可读价格正文，降智看诊断与多源印证，
+公司动态看公告/财报/监管语义；影子专用的“技术综述/研究解读”则承接有技术深度、
+但没有作者本人实施证据的研究解释，避免把高质量二手综合误写成一线实测。配置和入口分别为：
+
+```bash
+python scripts/audit_source_partitions.py
+```
+
+它同时只读分析正式 `data/raw` 基线、采集 `config/source_audit.yaml` 中的候选，并生成
+“关注对象 × 发布/定价/状态/公司材料”覆盖矩阵。候选数据写入 `data/source_audit/`，
+报告写入 `reports/source-audit/`，均不进入正式日报。Lilian Weng 等低频原作者使用显式的
+扩展内容回看窗，并按 `low_frequency` 节奏单独判断，不会因为日更活跃度低而与新闻聚合器
+直接比较。配置为低频轮换的作者不会加入无人值守采样，但可用
+`--only trial_jay_alammar` 这类显式专项调用；历史资料库入口即使显式指定也不会自动抓取。
+
+其中 `expert_author` 轨道首批影子采样 10 个来源：Lilian Weng、Sebastian Raschka、
+Eugene Yan、Hamel Husain、Shreya Shankar、Armin Ronacher、Max Woolf、
+AI as Normal Technology、Jason Liu、Cameron Wolfe。Tim Dettmers、Jay Alammar、
+Thorsten Ball 登记为低频轮换；Chip Huyen、Gwern、Colah 只保留历史检索入口。
+
+作者 RSS 的长正文仅在采集进程内用于派生技术主题、方法、第一人称实施、综述和利益关系
+命中；落盘快照只保存这些命中、正文长度和哈希，不保存第三方全文。只有明确出现作者本人
+运行、构建或评测的文章才进“一线实测”，否则归影子“技术综述/研究解读”。Eugene Yan
+与 Anthropic、Jason Liu 与 OpenAI Codex 的现任关系在配置和报告中单列；涉及本公司产品时
+标记利益关系，但不自动否定其一线信息价值。
+
 ### Windows 定时（Task Scheduler）
 
 ```powershell

@@ -17,7 +17,9 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
+from html import unescape
 from pathlib import Path
+from urllib.parse import urljoin, urlsplit
 
 import requests
 import yaml
@@ -28,6 +30,8 @@ UA = "frontier-radar/0.1 (personal news pipeline; +https://github.com/MIDDLESECO
 TIMEOUT = 30
 
 X_LINK_RE = re.compile(r"https?://(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})/status/(\d+)")
+HTTP_URL_RE = re.compile(r"https?://[^\s<>'\"&]+", re.IGNORECASE)
+HREF_RE = re.compile(r"\bhref\s*=\s*['\"]([^'\"]+)['\"]", re.IGNORECASE)
 # X 的保留路径段（x.com/i/status/... 等非用户名路径），挖掘时即过滤
 X_RESERVED_PATHS = {"i", "search", "home", "intent", "hashtag", "explore", "share"}
 TAG_RE = re.compile(r"<[^>]+>")
@@ -41,7 +45,12 @@ def http_get(url, accept=None):
     headers = {"User-Agent": UA}
     if accept:
         headers["Accept"] = accept
-    resp = requests.get(url, headers=headers, timeout=TIMEOUT)
+    try:
+        resp = requests.get(url, headers=headers, timeout=TIMEOUT)
+    except (requests.ConnectionError, requests.Timeout):
+        # 部分公开 feed 偶发在 TLS 握手或首包阶段断开；一次短重试即可区分瞬时故障与持续阻断。
+        time.sleep(1)
+        resp = requests.get(url, headers=headers, timeout=TIMEOUT)
     if resp.status_code == 429:  # 限流：按 Retry-After（上限 60s）退避一次
         wait = min(int(resp.headers.get("Retry-After", 30) or 30), 60)
         time.sleep(wait)
@@ -54,6 +63,11 @@ def strip_tags(html):
     return TAG_RE.sub(" ", html or "").strip()
 
 
+def visible_html_text(value):
+    """移除脚本、样式与标签，供页面探针和只在内存使用的审计正文共用。"""
+    return re.sub(r"\s+", " ", strip_tags(SCRIPT_STYLE_RE.sub(" ", value or ""))).strip()
+
+
 def mine_x_links(text):
     """从任意文本提取推文链接（归一化为 x.com/<handle>/status/<id>），过滤保留路径段。"""
     return sorted({
@@ -61,6 +75,22 @@ def mine_x_links(text):
         for m in X_LINK_RE.findall(text or "")
         if m[0].lower() not in X_RESERVED_PATHS
     })
+
+
+def extract_http_links(text, base_url=""):
+    """在清理 RSS HTML 前保留正文外链；页面内容只作为数据解析。"""
+    decoded = unescape(text or "")
+    candidates = list(HREF_RE.findall(decoded)) + list(HTTP_URL_RE.findall(decoded))
+    links = set()
+    for candidate in candidates:
+        resolved = urljoin(base_url, candidate.strip()).rstrip(".,);]}")
+        try:
+            parts = urlsplit(resolved)
+        except ValueError:
+            continue
+        if parts.scheme in ("http", "https") and parts.hostname:
+            links.add(resolved)
+    return sorted(links)
 
 
 def _first_text(elem, *paths):
@@ -117,6 +147,11 @@ def fetch_rss(src):
     items = parse_feed(resp.content)
     for it in items:
         full = it.pop("_fulltext", "") or it.get("summary") or ""
+        it["external_urls"] = extract_http_links(full, it.get("url", ""))
+        if src.get("audit_fulltext"):
+            # 仅供影子审计在本次进程内派生特征；调用方落盘前必须删除该临时字段。
+            limit = int(src.get("audit_fulltext_char_limit", 100_000))
+            it["_audit_fulltext"] = strip_tags(full)[:limit]
         if src.get("mine_x_links"):
             it["x_links"] = mine_x_links(full)
         it["summary"] = strip_tags(it["summary"])[:2000]
@@ -284,12 +319,16 @@ def fetch_html_stub(src):
 
     原始 HTML 包含构建号、脚本与 hydration 数据，直接哈希会把页面骨架变化误报为
     内容更新。可选的 content_required_patterns 用于确认关键正文确实抓到；不可读状态
-    只在首次发现或恢复时进入简报，不能被表述成价格/发布变化。
+    只在首次发现或恢复时进入简报，不能被表述成价格/发布变化。官方 Markdown 端点
+    可声明 content_format=markdown，保留组件属性中的表格数据，不按 HTML 标签剥离。
     """
     resp = http_get(src["url"])
     if resp.encoding in (None, "ISO-8859-1"):  # 无 charset 头时 requests 默认 latin-1，中文站会乱码
         resp.encoding = resp.apparent_encoding or "utf-8"
-    text = re.sub(r"\s+", " ", strip_tags(SCRIPT_STYLE_RE.sub(" ", resp.text)))
+    if src.get("content_format") == "markdown":
+        text = re.sub(r"\s+", " ", resp.text).strip()
+    else:
+        text = visible_html_text(resp.text)
     content_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
     response_sha = hashlib.sha256(resp.content).hexdigest()
     required = src.get("content_required_patterns") or []

@@ -1,0 +1,111 @@
+# Reddit 信源影子审计池。
+#
+# 这里的条目不会进入正式日报；scripts/audit_reddit_sources.py 会把结果写入
+# data/reddit_audit/ 与 reports/reddit-source-audit/（均属本地私有层）。候选池故意
+# 同时包含技术社区、厂商社区与泛 AI 对照组，避免只在熟悉的 ML 社区里循环筛选。
+
+audit:
+  duration_days: 14
+  max_items_per_subreddit: 25
+  request_delay_seconds: 6
+  keep_days: 21
+  signal_match_window_days: 30
+
+  # 这些域名只作为“直接证据链接”代理，不等同于已经核验过的原创来源。
+  direct_evidence_domains:
+    - arxiv.org
+    - github.com
+    - gitlab.com
+    - huggingface.co
+    - openreview.net
+    - paperswithcode.com
+    - pytorch.org
+    - tensorflow.org
+    - jax.readthedocs.io
+    - developer.nvidia.com
+    - docs.vllm.ai
+    - llama.cpp
+
+  # 技术密度是可复算的文本代理分，不是语义裁决。至少命中两个不同组，或同时有
+  # 直接证据链接与一个技术组，才计作 technical_proxy。
+  technical_marker_groups:
+    implementation: [implementation, implemented, code, github, repo, pull request, patch, kernel, cuda, pytorch, jax, rust, python, c++, api]
+    measurement: [benchmark, eval, ablation, latency, throughput, tokens/s, tok/s, vram, ram, memory, accuracy, precision, recall, p95, ms, reproducible]
+    methods: [fine-tun, quantiz, inference, training, distillation, attention, transformer, rag, retrieval, agent, tool call, context window, embedding]
+    research: [paper, arxiv, openreview, dataset, experiment, baseline, methodology, results, weights, model card]
+    operations: [deployment, production, serving, observability, orchestration, kubernetes, docker, gpu, incident, regression, migration, pipeline]
+
+  noise_markers: [career, resume, interview, beginner, roadmap, eli5, meme, funny, homework, course recommendation, which model should i use, is ai dead]
+
+subreddits:
+  # 本地模型与运行时
+  - {name: LocalLLaMA, category: local-models, role: incumbent}
+  - {name: llama_cpp, category: local-models, role: candidate}
+  - {name: ollama, category: local-models, role: candidate}
+  - {name: LocalAI, category: local-models, role: candidate}
+  - {name: LocalLLM, category: local-models, role: candidate}
+  - {name: open_source_AI, category: local-models, role: candidate}
+
+  # 研究与方法
+  - {name: MachineLearning, category: research, role: candidate}
+  - {name: deeplearning, category: research, role: candidate}
+  - {name: reinforcementlearning, category: research, role: candidate}
+  - {name: computervision, category: research, role: candidate}
+  - {name: LanguageTechnology, category: research, role: candidate}
+  - {name: NLP, category: research, role: candidate}
+  - {name: MLQuestions, category: research, role: candidate}
+  - {name: learnmachinelearning, category: research, role: candidate}
+  - {name: datasets, category: research, role: candidate}
+  - {name: LanguageModels, category: research, role: candidate}
+
+  # Agent 与编码助手
+  - {name: AI_Agents, category: agents-coding, role: candidate}
+  - {name: LLMDevs, category: agents-coding, role: candidate}
+  - {name: ClaudeAI, category: agents-coding, role: incumbent}
+  - {name: ClaudeCode, category: agents-coding, role: candidate}
+  - {name: codex, category: agents-coding, role: incumbent}
+  - {name: OpenAIcodex, category: agents-coding, role: incumbent}
+  - {name: ChatGPTCoding, category: agents-coding, role: candidate}
+  - {name: CursorAI, category: agents-coding, role: candidate}
+  - {name: CLine, category: agents-coding, role: candidate}
+  - {name: GithubCopilot, category: agents-coding, role: candidate}
+  - {name: ChatGPTPro, category: agents-coding, role: candidate}
+  - {name: LangChain, category: agents-coding, role: candidate}
+  - {name: LlamaIndex, category: agents-coding, role: candidate}
+
+  # MLOps、数据与部署（用来寻找生产证据，而不只是模型讨论）
+  - {name: mlops, category: mlops-infra, role: candidate}
+  - {name: dataengineering, category: mlops-infra, role: candidate}
+  - {name: devops, category: mlops-infra, role: candidate}
+  - {name: kubernetes, category: mlops-infra, role: candidate}
+  - {name: Docker, category: mlops-infra, role: candidate}
+  - {name: selfhosted, category: mlops-infra, role: candidate}
+  - {name: homelab, category: mlops-infra, role: candidate}
+  - {name: GPU, category: mlops-infra, role: candidate}
+  - {name: aws, category: mlops-infra, role: candidate}
+  - {name: googlecloud, category: mlops-infra, role: candidate}
+  - {name: AZURE, category: mlops-infra, role: candidate}
+  - {name: vllm, category: mlops-infra, role: candidate}
+  - {name: pytorch, category: mlops-infra, role: candidate}
+  - {name: huggingface, category: mlops-infra, role: candidate}
+  - {name: nvidia, category: mlops-infra, role: candidate}
+
+  # 模态与具身方向
+  - {name: StableDiffusion, category: modalities-robotics, role: candidate}
+  - {name: comfyui, category: modalities-robotics, role: candidate}
+  - {name: robotics, category: modalities-robotics, role: candidate}
+  - {name: ROS, category: modalities-robotics, role: candidate}
+
+  # 厂商与泛 AI：保留作对照，防止“活跃度高”被误当成“技术含量高”
+  - {name: OpenAI, category: general-control, role: control}
+  - {name: ChatGPT, category: general-control, role: control}
+  - {name: artificial, category: general-control, role: control}
+  - {name: singularity, category: general-control, role: control}
+  - {name: GenerativeAI, category: general-control, role: control}
+  - {name: GeminiAI, category: general-control, role: control}
+  - {name: Bard, category: general-control, role: control}
+  - {name: perplexity_ai, category: general-control, role: control}
+  - {name: Grok, category: general-control, role: control}
+  - {name: ExperiencedDevs, category: general-control, role: control}
+  - {name: DeepSeek, category: general-control, role: control}
+  - {name: MistralAI, category: general-control, role: control}

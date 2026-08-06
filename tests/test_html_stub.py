@@ -64,6 +64,13 @@ class HtmlStubTest(unittest.TestCase):
         self.assertIn("Pro plan $20 monthly", item["summary"])
         self.assertLessEqual(len(item["summary"]), 5000)
 
+    def test_markdown_mode_preserves_component_table_attributes(self):
+        self.src["content_format"] = "markdown"
+        self.src["content_required_patterns"] = [r"[$￥¥]", "kimi-k3"]
+        item = self.fetch('<DocTable rows={[[`kimi-k3`,`¥100.00`]]} />')
+        self.assertTrue(item["readable"])
+        self.assertIn("¥100.00", item["summary"])
+
 
 if __name__ == "__main__":
     unittest.main()

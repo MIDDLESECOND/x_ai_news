@@ -1,0 +1,596 @@
+# 非 Reddit 分区的通用影子审计。
+# 候选源不会进入 data/raw 或日报；只写 data/source_audit 与私有 reports/source-audit。
+
+audit:
+  duration_days: 14
+  keep_days: 21
+  request_delay_seconds: 2
+  signal_match_window_days: 30
+  # 只扩展影子审计的召回，不修改正式 topics.yaml 或日报范围。
+  discovery_keywords: [Gemini, Google DeepMind, Google AI Studio]
+
+partitions:
+  release:
+    section: 今日发布
+    label: 发布
+    profile: release
+  field_test:
+    section: 一线实测
+    label: 实测
+    profile: field_test
+  research_synthesis:
+    section: 技术综述/研究解读
+    label: 技术综述/研究解读
+    profile: research_synthesis
+    shadow_only: true
+  pricing:
+    section: 定价与额度变动
+    label: 定价/额度
+    profile: pricing
+  degradation:
+    section: 降智观察
+    label: 降智/事故
+    profile: degradation
+  company:
+    section: 公司动态
+    label: 公司动态
+    profile: company
+
+# 所有 URL 均于 2026-08-05 做过匿名可达性与解析检查。
+candidates:
+  # 独立技术作者/聚合器：让它们与 AINews、Latent Space 比独家信号、原链与时延。
+  - id: trial_interconnects
+    name: Interconnects
+    type: rss
+    url: https://www.interconnects.ai/feed
+    tier: aggregator
+    evidence_role: synthesis
+    routing: classify
+    partitions: [release, field_test, pricing, degradation, company]
+    role: candidate
+    enabled: true
+
+  - id: trial_import_ai
+    name: Import AI
+    type: rss
+    url: https://jack-clark.net/feed/
+    tier: aggregator
+    evidence_role: synthesis
+    routing: classify
+    partitions: [release, field_test, company]
+    role: candidate
+    enabled: true
+
+  - id: trial_simon_willison
+    name: Simon Willison
+    type: rss
+    url: https://simonwillison.net/atom/everything/
+    tier: community
+    evidence_role: original_author
+    routing: classify
+    partitions: [release, field_test, pricing, degradation, company]
+    role: candidate
+    enabled: true
+
+  # expert_author 首批影子池：14 天只衡量采集稳定性；内容质量统一看 400 天回看窗。
+  # RSS 全文仅在采集进程内派生方法/综述/利益关系特征，快照不保存第三方全文。
+  - id: trial_lilian_weng
+    name: Lil'Log (Lilian Weng)
+    type: rss
+    url: https://lilianweng.github.io/index.xml
+    tier: community
+    track: expert_author
+    audit_group: first_batch
+    audit_status: shadow_sampling
+    evidence_role: original_author
+    cadence: low_frequency
+    lookback_days: 400
+    audit_fulltext: true
+    audit_max_items: 40
+    audit_body_fallback_items: 3
+    latest_seen: '2026-07-04'
+    routing: expert_author
+    partitions: [field_test, research_synthesis]
+    role: candidate
+    enabled: true
+
+  - id: trial_sebastian_raschka
+    name: Sebastian Raschka
+    type: rss
+    url: https://magazine.sebastianraschka.com/feed
+    tier: community
+    track: expert_author
+    audit_group: first_batch
+    audit_status: shadow_sampling
+    evidence_role: original_author
+    lookback_days: 400
+    audit_fulltext: true
+    audit_max_items: 40
+    latest_seen: '2026-07-18'
+    routing: expert_author
+    partitions: [field_test, research_synthesis]
+    role: candidate
+    enabled: true
+
+  - id: trial_eugene_yan
+    name: Eugene Yan
+    type: rss
+    url: https://eugeneyan.com/rss/
+    tier: community
+    track: expert_author
+    audit_group: first_batch
+    audit_status: shadow_sampling
+    evidence_role: original_author
+    affiliation: Anthropic
+    affiliation_role: employee
+    conflict_keywords: [Anthropic, Claude]
+    lookback_days: 400
+    audit_fulltext: true
+    audit_max_items: 40
+    latest_seen: '2026-06-21'
+    routing: expert_author
+    partitions: [field_test, research_synthesis]
+    role: candidate
+    enabled: true
+
+  - id: trial_hamel_husain
+    name: Hamel Husain
+    type: rss
+    url: https://hamel.dev/index.xml
+    tier: community
+    track: expert_author
+    audit_group: first_batch
+    audit_status: shadow_sampling
+    evidence_role: original_author
+    lookback_days: 400
+    audit_fulltext: true
+    audit_max_items: 40
+    latest_seen: '2026-07-11'
+    routing: expert_author
+    partitions: [field_test, research_synthesis]
+    role: candidate
+    enabled: true
+
+  - id: trial_shreya_shankar
+    name: Shreya Shankar
+    type: rss
+    url: https://www.sh-reya.com/rss.xml
+    tier: community
+    track: expert_author
+    audit_group: first_batch
+    audit_status: shadow_sampling
+    evidence_role: original_author
+    lookback_days: 400
+    audit_fulltext: true
+    audit_max_items: 40
+    latest_seen: '2026-05-21'
+    audit_body_fallback_items: 5
+    routing: expert_author
+    partitions: [field_test, research_synthesis]
+    role: candidate
+    enabled: true
+
+  - id: trial_armin_ronacher
+    name: Armin Ronacher
+    type: rss
+    url: https://lucumr.pocoo.org/feed.atom
+    tier: community
+    track: expert_author
+    audit_group: first_batch
+    audit_status: shadow_sampling
+    evidence_role: original_author
+    lookback_days: 400
+    audit_fulltext: true
+    audit_max_items: 40
+    latest_seen: '2026-07-24'
+    routing: expert_author
+    partitions: [field_test, research_synthesis]
+    role: candidate
+    enabled: true
+
+  - id: trial_max_woolf
+    name: Max Woolf
+    type: rss
+    url: https://minimaxir.com/index.xml
+    tier: community
+    track: expert_author
+    audit_group: first_batch
+    audit_status: shadow_sampling
+    evidence_role: original_author
+    lookback_days: 400
+    audit_fulltext: true
+    audit_max_items: 40
+    latest_seen: '2026-07-23'
+    routing: expert_author
+    partitions: [field_test, research_synthesis]
+    role: candidate
+    enabled: true
+
+  - id: trial_ai_as_normal_technology
+    name: AI as Normal Technology
+    type: rss
+    url: https://www.normaltech.ai/feed
+    tier: community
+    track: expert_author
+    audit_group: first_batch
+    audit_status: shadow_sampling
+    evidence_role: original_author
+    lookback_days: 400
+    audit_fulltext: true
+    audit_max_items: 40
+    latest_seen: '2026-08-05'
+    routing: expert_author
+    partitions: [field_test, research_synthesis]
+    role: candidate
+    enabled: true
+
+  - id: trial_jason_liu
+    name: Jason Liu
+    type: rss
+    url: https://jxnl.co/feed_rss_created.xml
+    tier: community
+    track: expert_author
+    audit_group: first_batch
+    audit_status: shadow_sampling
+    evidence_role: original_author
+    affiliation: OpenAI (Codex team)
+    affiliation_role: employee
+    conflict_keywords: [OpenAI, Codex, GPT]
+    lookback_days: 400
+    audit_fulltext: true
+    audit_max_items: 40
+    latest_seen: '2026-07-05'
+    routing: expert_author
+    partitions: [field_test, research_synthesis]
+    role: candidate
+    enabled: true
+
+  - id: trial_cameron_wolfe
+    name: Cameron Wolfe
+    type: rss
+    url: https://cameronrwolfe.substack.com/feed
+    tier: community
+    track: expert_author
+    audit_group: first_batch
+    audit_status: shadow_sampling
+    evidence_role: original_author
+    lookback_days: 400
+    audit_fulltext: true
+    audit_max_items: 40
+    latest_seen: '2026-07-20'
+    routing: expert_author
+    partitions: [field_test, research_synthesis]
+    role: candidate
+    enabled: true
+
+  # 低频轮换/专项调用：端点可用，但不计入首批完整采样日。
+  - id: trial_tim_dettmers
+    name: Tim Dettmers
+    type: rss
+    url: https://timdettmers.com/feed/
+    tier: community
+    track: expert_author
+    audit_group: rotation
+    audit_status: low_frequency_rotation
+    evidence_role: original_author
+    cadence: low_frequency
+    lookback_days: 1200
+    audit_fulltext: true
+    audit_max_items: 40
+    latest_seen: '2026-01-27'
+    routing: expert_author
+    partitions: [field_test, research_synthesis]
+    role: candidate
+    enabled: false
+
+  - id: trial_jay_alammar
+    name: Jay Alammar
+    type: rss
+    url: https://newsletter.languagemodels.co/feed
+    tier: community
+    track: expert_author
+    audit_group: rotation
+    audit_status: low_frequency_rotation
+    evidence_role: original_author
+    cadence: low_frequency
+    lookback_days: 1200
+    audit_fulltext: true
+    audit_max_items: 40
+    latest_seen: '2025-11-03'
+    routing: expert_author
+    partitions: [field_test, research_synthesis]
+    role: candidate
+    enabled: false
+
+  - id: trial_thorsten_ball
+    name: Thorsten Ball
+    type: rss
+    url: https://thorstenball.com/atom.xml
+    tier: community
+    track: expert_author
+    audit_group: rotation
+    audit_status: low_frequency_rotation
+    evidence_role: original_author
+    cadence: low_frequency
+    lookback_days: 1800
+    audit_fulltext: true
+    audit_max_items: 40
+    latest_seen: '2022-05-17'
+    routing: expert_author
+    partitions: [field_test, research_synthesis]
+    role: candidate
+    enabled: false
+
+  # 历史资料库：保留公开入口与最后更新时间，不参与无人值守抓取或晋级评分。
+  - id: archive_chip_huyen
+    name: Chip Huyen
+    type: rss
+    url: https://huyenchip.com/feed.xml
+    tier: community
+    track: expert_author
+    audit_group: historical_archive
+    audit_status: historical_archive
+    evidence_role: original_author
+    latest_seen: '2025-01-16'
+    routing: expert_author
+    partitions: [research_synthesis]
+    role: archive
+    enabled: false
+
+  - id: archive_gwern
+    name: Gwern
+    type: rss
+    url: https://gwern.substack.com/feed
+    tier: community
+    track: expert_author
+    audit_group: historical_archive
+    audit_status: historical_archive
+    evidence_role: original_author
+    latest_seen: '2021-06-11'
+    routing: expert_author
+    partitions: [research_synthesis]
+    role: archive
+    enabled: false
+
+  - id: archive_colah
+    name: Colah
+    type: rss
+    url: https://colah.github.io/rss.xml
+    tier: community
+    track: expert_author
+    audit_group: historical_archive
+    audit_status: historical_archive
+    evidence_role: original_author
+    latest_seen: '2019-05-30'
+    routing: expert_author
+    partitions: [research_synthesis]
+    role: archive
+    enabled: false
+
+  # 官方发布/公司动态候选。
+  - id: trial_deepmind_blog
+    name: Google DeepMind Blog
+    type: rss
+    url: https://deepmind.google/blog/rss.xml
+    tier: official
+    routing: classify
+    partitions: [release, company]
+    role: candidate
+    enabled: true
+
+  - id: trial_google_ai_blog
+    name: Google AI Blog
+    type: rss
+    url: https://blog.google/technology/ai/rss/
+    tier: official
+    routing: classify
+    partitions: [release, company]
+    role: candidate
+    enabled: true
+
+  - id: trial_deepseek_updates
+    name: DeepSeek API Changelog
+    type: html_stub
+    url: https://api-docs.deepseek.com/updates/
+    content_required_patterns: ['DeepSeek', 'model|模型|更新|release']
+    tier: official
+    routing: forced
+    partitions: [release]
+    role: candidate
+    enabled: true
+
+  - id: trial_meta_llama_hf
+    name: HF Meta Llama org 最新权重
+    type: hf_models
+    url: "https://huggingface.co/api/models?author=meta-llama&sort=lastModified&direction=-1&limit=10"
+    tier: official
+    routing: classify
+    partitions: [release]
+    role: candidate
+    enabled: true
+
+  # Meta 官方 AI 博客无 RSS；分别检验它对发布与公司材料的实际价值。
+  - id: trial_meta_ai_blog
+    name: Meta AI Blog
+    type: html_stub
+    url: https://ai.meta.com/blog/
+    content_required_patterns: ['Meta', '20\d{2}']
+    tier: official
+    routing: forced
+    partitions: [release, company]
+    role: candidate
+    enabled: true
+
+  - id: trial_kimi_blog
+    name: Kimi Official Blog
+    type: html_stub
+    url: https://www.kimi.com/blog/
+    content_required_patterns: ['Kimi', '20\d{2}']
+    tier: official
+    routing: forced
+    partitions: [release, company]
+    role: candidate
+    enabled: true
+
+  # 旧站公开 RSS 仍可解析；新 qwen.ai 研究页仅浏览器可读，先验证旧 feed 是否继续更新。
+  - id: trial_qwen_blog
+    name: Qwen Official Blog RSS
+    type: rss
+    url: https://qwenlm.github.io/blog/index.xml
+    tier: official
+    routing: forced_recent
+    partitions: [release, company]
+    role: candidate
+    enabled: true
+
+  # 直接定价页：强制归定价分区，但“可读”只表示抓到了币种/价格正文，不表示发生调价。
+  - id: trial_gemini_pricing
+    name: Gemini API Pricing
+    type: html_stub
+    url: https://ai.google.dev/gemini-api/docs/pricing
+    content_required_patterns: ['[$￥¥]|USD|CNY|元']
+    tier: official
+    routing: forced
+    partitions: [pricing]
+    role: candidate
+    enabled: true
+
+  - id: trial_xai_pricing
+    name: xAI API Pricing
+    type: html_stub
+    url: https://docs.x.ai/developers/pricing
+    content_required_patterns: ['[$￥¥]|USD|CNY|元']
+    tier: official
+    routing: forced
+    partitions: [pricing]
+    role: candidate
+    enabled: true
+
+  - id: trial_qwen_pricing
+    name: Alibaba Model Studio Pricing
+    type: html_stub
+    url: https://help.aliyun.com/en/model-studio/model-pricing
+    content_required_patterns: ['[$￥¥]|USD|CNY|元']
+    tier: official
+    routing: forced
+    partitions: [pricing]
+    role: candidate
+    enabled: true
+
+  # Chrome 用于发现官方动态页；正式影子采样仍落到无需浏览器会话的 Markdown 端点。
+  - id: trial_kimi_pricing
+    name: Kimi K3 API Pricing
+    type: html_stub
+    url: https://platform.kimi.com/docs/pricing/chat-k3.md
+    content_format: markdown
+    content_required_patterns: ['[$￥¥]|USD|CNY|元', 'kimi-k3']
+    tier: official
+    routing: forced
+    partitions: [pricing]
+    role: candidate
+    enabled: true
+
+  # 官方状态页面能否被匿名探针可靠读取，本身就是审计对象。
+  - id: trial_gemini_status
+    name: Google AI Studio / Gemini API Status
+    type: html_stub
+    url: https://aistudio.google.com/status
+    content_required_patterns: ['operational|available|service status|incident']
+    tier: official
+    routing: forced
+    partitions: [degradation]
+    role: candidate
+    enabled: true
+
+  # Chrome 发现了被首页 403 隐藏的公开 RSS；只审计窗口内事件，避免历史事故重复灌入。
+  - id: trial_xai_status
+    name: xAI Service Status
+    type: rss
+    url: https://status.x.ai/feed.xml
+    tier: official
+    routing: forced_recent
+    partitions: [degradation]
+    role: candidate
+    enabled: true
+
+  # Chrome 从订阅弹窗发现 Flashduty 的公开 feed；连接层偶发 EOF，由通用一次重试兜底。
+  - id: trial_deepseek_status
+    name: DeepSeek Service Status
+    type: rss
+    url: https://status.deepseek.com/feed.rss
+    tier: official
+    routing: forced_recent
+    partitions: [degradation]
+    role: candidate
+    enabled: true
+
+  - id: trial_kimi_status
+    name: Moonshot / Kimi Service Status
+    type: rss
+    url: https://status.moonshot.cn/history.rss
+    tier: official
+    routing: forced_recent
+    partitions: [degradation]
+    role: candidate
+    enabled: true
+
+# 覆盖矩阵只描述“是否有直接源”，不把聚合器或 OpenRouter 当成厂商直接覆盖。
+coverage:
+  surfaces: [release, pricing, degradation, company]
+  # 与正式 topics.yaml:model_keywords 对账；新增模型族却未补覆盖对象时，审计入口直接报错。
+  target_aliases:
+    OpenAI: [Luna, GPT-5.6]
+    Anthropic: [Claude]
+    DeepSeek: [DeepSeek, V4-Flash, V4 Flash]
+    Z.ai: [GLM]
+    xAI: [Grok]
+    Kimi: [Kimi, K3]
+    Qwen: [Qwen]
+    Gemini: []
+    Meta / Llama: [Llama]
+  targets:
+    OpenAI:
+      release: {incumbent: [openai_blog]}
+      pricing: {incumbent: [openai_pricing]}
+      degradation: {incumbent: [status_openai, codexradar]}
+      company: {incumbent: [openai_blog]}
+    Anthropic:
+      release: {incumbent: [anthropic_blog, anthropic_engineering]}
+      pricing: {incumbent: [anthropic_pricing]}
+      degradation: {incumbent: [status_anthropic]}
+      company: {incumbent: [anthropic_blog]}
+    DeepSeek:
+      release: {incumbent: [hf_deepseek, deepseek_github], trial: [trial_deepseek_updates]}
+      pricing: {incumbent: [deepseek_pricing]}
+      degradation: {trial: [trial_deepseek_status]}
+      company: {gap: '未发现独立官方新闻/公司公告 feed；GitHub 仅算工程发布', manual: '官网、透明度页与官方社媒需人工复核'}
+    Z.ai:
+      release: {incumbent: [hf_zai, zai_blog]}
+      pricing: {incumbent: [zhipu_pricing]}
+      degradation: {gap: '未验证到公开 incident feed', manual: 'open.bigmodel.cn/status 在 Chrome 中仅显示应用壳'}
+      company: {incumbent: [zai_blog, hk_02513]}
+    xAI:
+      release: {incumbent: [xai_blog]}
+      pricing: {trial: [trial_xai_pricing]}
+      degradation: {trial: [trial_xai_status]}
+      company: {incumbent: [xai_blog]}
+    Kimi:
+      release: {incumbent: [hf_moonshot], trial: [trial_kimi_blog]}
+      pricing: {trial: [trial_kimi_pricing]}
+      degradation: {trial: [trial_kimi_status]}
+      company: {trial: [trial_kimi_blog]}
+    Qwen:
+      release: {incumbent: [hf_qwen], trial: [trial_qwen_blog], manual: '新 qwen.ai 研究页浏览器可读但未发现 feed'}
+      pricing: {trial: [trial_qwen_pricing]}
+      degradation: {gap: '阿里云健康页含 Platform for AI，但未验证到 Qwen/Model Studio 专属 feed', manual: 'status.alibabacloud.com 可浏览器复核'}
+      company: {trial: [trial_qwen_blog], gap: '旧博客 RSS 是否继续更新待审计；新站无已发现 feed'}
+    Gemini:
+      release: {trial: [trial_deepmind_blog, trial_google_ai_blog]}
+      pricing: {trial: [trial_gemini_pricing]}
+      degradation: {trial: [trial_gemini_status], manual: 'Chrome 可读完整事故历史；匿名 HTML 探针仍只得到页面壳'}
+      company: {trial: [trial_deepmind_blog, trial_google_ai_blog]}
+    Meta / Llama:
+      release: {trial: [trial_meta_llama_hf, trial_meta_ai_blog]}
+      pricing: {not_applicable: 'Meta 不提供 Llama 第一方托管 API 牌价'}
+      degradation: {not_applicable: '无第一方托管推理服务状态面'}
+      company: {trial: [trial_meta_ai_blog]}
