@@ -53,7 +53,7 @@ class SourceHealthTest(unittest.TestCase):
                                      "2026-08-05T12:00:00Z")],
                 "log": {"fetched_at": "2026-08-05T12:00:00Z", "sources": {
                     "official": {"status": "error"},
-                    "community": {"status": "skipped"},
+                    "community": {"status": "cached"},
                 }},
             },
         ]
@@ -68,7 +68,36 @@ class SourceHealthTest(unittest.TestCase):
         self.assertEqual(rows["official"]["qualified_observations"], 2)
         self.assertEqual(rows["official"]["unique_qualified_items"], 1)
         self.assertEqual(rows["community"]["attempt_days"], 0)
-        self.assertEqual(rows["community"]["skipped_days"], 2)
+        self.assertEqual(rows["community"]["skipped_days"], 1)
+        self.assertEqual(rows["community"]["cached_days"], 1)
+        self.assertEqual(rows["community"]["stale_days"], 0)
+        self.assertEqual(rows["community"]["deferred_days"], 0)
+
+    def test_deferred_cooldown_is_not_counted_as_network_attempt(self):
+        samples = [{
+            "day": "2026-08-05", "payloads": [],
+            "log": {"fetched_at": "2026-08-05T12:00:00Z", "sources": {
+                "official": {"status": "deferred"},
+            }},
+        }]
+        rows = {row["source_id"]: row for row in
+                health.collect_health(SOURCES, TOPICS, samples)["sources"]}
+        self.assertEqual(rows["official"]["attempt_days"], 0)
+        self.assertEqual(rows["official"]["deferred_days"], 1)
+
+    def test_partial_day_is_an_attempt_but_not_a_full_success(self):
+        samples = [{
+            "day": "2026-08-05", "payloads": [],
+            "log": {"fetched_at": "2026-08-05T12:00:00Z", "sources": {
+                "official": {"status": "partial"},
+            }},
+        }]
+        rows = {row["source_id"]: row for row in
+                health.collect_health(SOURCES, TOPICS, samples)["sources"]}
+        self.assertEqual(rows["official"]["attempt_days"], 1)
+        self.assertEqual(rows["official"]["partial_days"], 1)
+        self.assertEqual(rows["official"]["success_days"], 0)
+        self.assertEqual(rows["official"]["success_rate"], 0.0)
 
     def test_story_contribution_metrics_preserve_source_roles(self):
         samples = [{

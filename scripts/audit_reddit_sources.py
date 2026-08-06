@@ -8,11 +8,12 @@ reports/reddit-source-audit/YYYY-MM-DD.md。
 用法：
   python scripts/audit_reddit_sources.py
   python scripts/audit_reddit_sources.py --report-only
-  python scripts/audit_reddit_sources.py --only MachineLearning,mlops --delay 0
+  python scripts/audit_reddit_sources.py --only MachineLearning,mlops
 """
 import argparse
 import html
 import json
+import math
 import re
 import shutil
 import statistics
@@ -158,13 +159,30 @@ def collect_one(entry, audit_cfg, max_items):
     }
 
 
+def rotating_batch(entries, day, limit):
+    """Select one deterministic non-overlapping batch for a calendar day."""
+    entries = list(entries)
+    if not entries:
+        return []
+    limit = max(1, min(int(limit), len(entries)))
+    batches = math.ceil(len(entries) / limit)
+    batch_index = date.fromisoformat(day).toordinal() % batches
+    start = batch_index * limit
+    return entries[start:start + limit]
+
+
 def collect(config, day, only=None, delay=None, raw_root=AUDIT_RAW):
     audit_cfg = config["audit"]
-    selected = [s for s in config["subreddits"]
-                if not only or s["name"].lower() in only]
+    candidates = [s for s in config["subreddits"]
+                  if not only or s["name"].lower() in only]
+    batch_limit = 1
+    selected = (candidates[:batch_limit] if only
+                else rotating_batch(candidates, day, batch_limit))
     day_dir = raw_root / day
     day_dir.mkdir(parents=True, exist_ok=True)
-    wait = audit_cfg.get("request_delay_seconds", 6) if delay is None else delay
+    configured_wait = max(0.0, float(audit_cfg.get("request_delay_seconds", 300)))
+    wait = configured_wait if delay is None else max(configured_wait, delay)
+    daily_limit = 1
     max_items = audit_cfg.get("max_items_per_subreddit", 25)
     log_path = day_dir / "_audit_log.json"
     try:
@@ -175,6 +193,12 @@ def collect(config, day, only=None, delay=None, raw_root=AUDIT_RAW):
         "date": day,
         "started_at": log.get("started_at", datetime.now(timezone.utc).isoformat()),
         "sources": log.get("sources", {}),
+        "policy": {
+            "selection": "explicit-capped" if only else "daily-rotation",
+            "max_subreddits_per_run": batch_limit,
+            "max_requests_per_day": daily_limit,
+            "request_delay_seconds": wait,
+        },
     }
     # 进程可能在逐社区原子落盘后、写汇总日志前被终止；续跑时由快照恢复成功项。
     for path in day_dir.glob("r_*.json"):
@@ -186,6 +210,11 @@ def collect(config, day, only=None, delay=None, raw_root=AUDIT_RAW):
             # 当天已有成功快照时，后续瞬时 429/网络失败不能把日级结果降格为失败。
             log["sources"][payload.get("source", path.stem)] = {
                 "status": "ok", "items": len(payload.get("items", []))}
+    attempted_today = set(log["sources"])
+    remaining = max(0, daily_limit - len(attempted_today))
+    selected = [entry for entry in selected
+                if subreddit_id(entry["name"]) not in attempted_today][:remaining]
+    log["selected_sources"] = [subreddit_id(entry["name"]) for entry in selected]
     for index, entry in enumerate(selected):
         if index and wait:
             time.sleep(wait)
@@ -385,7 +414,7 @@ def score_rows(config, records, existing):
     rows = []
     for entry in config["subreddits"]:
         name = entry["name"]
-        snapshots = by_sub.get(name, [])
+        snapshots = sorted(by_sub.get(name, []), key=lambda p: p["sample_day"])[-duration:]
         unique = {}
         unique_times = {}
         fresh_daily = []
@@ -465,10 +494,12 @@ def pct(value):
 
 def render_report(config, rows, day):
     duration = config["audit"].get("duration_days", 14)
+    covered = sum(r["attempt_days"] > 0 for r in rows)
+    complete = sum(r["attempt_days"] >= duration for r in rows)
     sampled = max((r["attempt_days"] for r in rows), default=0)
     lines = [
         f"# Reddit 技术信源影子审计 — {day}", "",
-        f"> 状态：第 {sampled}/{duration} 个采样日。未满 {duration} 天前的排名只用于检查采集与代理指标，**不改变正式日报信源**。", "",
+        f"> 状态：低频轮换；{covered}/{len(rows)} 个社区已有样本，{complete}/{len(rows)} 个达到 {duration} 次，单社区最多 {sampled}/{duration} 次。未满窗口的排名只用于检查采集与代理指标，**不改变正式日报信源**。", "",
         "## 排名", "",
         "| subreddit | 类别 | 成功/尝试 | 24h 新帖中位数 | 唯一帖 | 技术代理 | 证据代理 | 直接证据链接 | 跨社区重复 | 噪声 | 对现有非 Reddit 命中 | 领先中位数 | 分数 | 建议 |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
@@ -482,25 +513,32 @@ def render_report(config, rows, day):
             f"{row['existing_matches']} | {lead} | {row['score']} | {row['decision']} |")
     lines += [
         "", "## 口径与边界", "",
-        "- 每个社区每天最多保留 25 条 `/new/.rss` 条目；跨日按 Reddit permalink 去重。`24h 新帖中位数`按抓取时刻前 24 小时估算，不等于 Reddit 的完整发帖量。",
+        f"- 审计每天最多轮换 {config['audit'].get('max_subreddits_per_run', 4)} 个社区；所有直接 Reddit 请求还受 `config/reddit_access.yaml` 的跨进程分钟级间隔与 UTC 日预算约束。失败和重试同样占预算。",
+        "- 每个社区每次最多保留 25 条 `/new/.rss` 条目；跨日按 Reddit permalink 去重。`24h 新帖中位数`按抓取时刻前 24 小时估算，不等于 Reddit 的完整发帖量。",
         "- `技术代理`要求命中至少两个不同技术词组，或同时含直接证据链接与一个技术词组；`证据代理`要求直接证据链接，或技术代理同时带具体量化值。它们是可复算筛查信号，不是人工语义裁决。",
         "- `直接证据链接`只表示正文链接到配置中的代码、论文、模型或工程文档域名；尚未核验链接内容，也不能证明发帖人就是原作者。",
         f"- `跨社区重复`按直接证据 URL 优先、标题次之估算，并要求两个条目的有效时间相距不超过 {config['audit'].get('signal_match_window_days', 30)} 天；无发布时间时以首次抓取时间兜底。`领先中位数`只比较同一窗口内现有 L1 中的非 Reddit 信源，正数表示 Reddit 更早；只对成功匹配的条目计算。",
-        "- 分数用于排序，不作为证据强度。满 14 天后仍需人工抽查高分与低分社区各一组，尤其核对 flair、正文方法学和评论区补证。",
+        "- 分数用于排序，不作为证据强度。每个社区满 14 次样本后仍需人工抽查高分与低分社区各一组，尤其核对 flair、正文方法学和评论区补证。",
         "", "## 晋级规则", "",
-        "- 核心候选：满 14 天、分数 ≥60、技术代理 ≥35%，且 24h 新帖中位数 ≥2。",
-        "- 轮换候选：满 14 天、分数 ≥42、技术代理 ≥22%。",
+        "- 核心候选：满 14 次样本、分数 ≥60、技术代理 ≥35%，且 24h 新帖中位数 ≥2。",
+        "- 轮换候选：满 14 次样本、分数 ≥42、技术代理 ≥22%。",
         "- `general-control` 永远只作对照，不会仅凭活跃度自动晋级。",
         "",
     ]
     return "\n".join(lines)
 
 
+def audit_window_days(config):
+    audit_cfg = config["audit"]
+    duration = audit_cfg.get("duration_days", 14)
+    batch = 1
+    sweeps = math.ceil(len(config["subreddits"]) / batch)
+    return duration * sweeps + 7
+
+
 def generate_report(config, day, raw_root=AUDIT_RAW, existing_raw=None, report_dir=REPORT_DIR):
     duration = config["audit"].get("duration_days", 14)
-    required = {subreddit_id(entry["name"]) for entry in config["subreddits"]}
-    sample_days = audit_sample_days(raw_root, day, duration, required)
-    records = load_audit_records(raw_root, day, duration, sample_days=sample_days)
+    records = load_audit_records(raw_root, day, audit_window_days(config))
     existing = existing_index(existing_raw or ROOT / "data" / "raw", day, duration)
     rows = score_rows(config, records, existing)
     report = render_report(config, rows, day)
@@ -515,19 +553,18 @@ def main():
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--report-only", action="store_true")
     parser.add_argument("--only", default="", help="仅抓指定 subreddit，逗号分隔；仍生成全池报告")
-    parser.add_argument("--delay", type=float, default=None, help="覆盖请求间隔秒数；0 仅用于测试")
+    parser.add_argument("--delay", type=float, default=None,
+                        help="增加审计层请求间隔；不能绕过全仓库 Reddit 硬限速")
     args = parser.parse_args()
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     with exclusive_lock(AUDIT_LOCK, stale_after=2 * 60 * 60):
         only = {x.strip().lower() for x in args.only.split(",") if x.strip()}
         duration = config["audit"].get("duration_days", 14)
-        required = {subreddit_id(entry["name"]) for entry in config["subreddits"]}
-        completed = completed_attempt_days(AUDIT_RAW, args.date, required)
-        if not args.report_only and not only and len(completed) >= duration:
-            latest = completed[-1]
-            path, rows = generate_report(config, latest)
+        path, rows = generate_report(config, args.date)
+        if (not args.report_only and not only and rows
+                and all(row["attempt_days"] >= duration for row in rows)):
             ok = sum(r["sample_days"] > 0 for r in rows)
-            print(f"审计已完成 {len(completed)} 个完整采样日；停止抓取。")
+            print(f"审计已完成：每个社区至少 {duration} 次尝试；停止抓取。")
             print(f"最终报告：{path}（{ok}/{len(rows)} 个社区有成功样本）")
             return 0
         if not args.report_only:

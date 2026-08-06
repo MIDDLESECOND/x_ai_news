@@ -24,10 +24,20 @@ from urllib.parse import urljoin, urlsplit
 import requests
 import yaml
 
+from http_fetch_state import (FetchCooldown, discard_cached_response,
+                              host_cooldown, host_lease_key, prepare_request,
+                              prune_cache, record_failure, record_host_cooldown,
+                              request_lease, retry_after_seconds, store_success)
+from reddit_rate_limit import is_reddit_url, reserve_request
+
 ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = ROOT / "data" / "state"
+HTTP_CACHE_ROOT = STATE_DIR / "http_cache"
 UA = "frontier-radar/0.1 (personal news pipeline; +https://github.com/MIDDLESECOND/x_ai_news)"
 TIMEOUT = 30
+HTTP_FORCE_REVALIDATE = False
+HTTP_LOGICAL_DAY = None
+_HTTP_EVENTS = []
 
 X_LINK_RE = re.compile(r"https?://(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})/status/(\d+)")
 HTTP_URL_RE = re.compile(r"https?://[^\s<>'\"&]+", re.IGNORECASE)
@@ -41,22 +51,329 @@ if sys.stdout:  # pythonw / stdout 分离的无控制台运行下 sys.stdout 为
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
-def http_get(url, accept=None):
+def take_http_events():
+    """Return and clear request-level observations for the current source."""
+    events = list(_HTTP_EVENTS)
+    _HTTP_EVENTS.clear()
+    return events
+
+
+def summarize_http_events(events):
+    counts = {}
+    for event in events:
+        status = str(event.get("cache_status") or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    attempts = sum(int(event.get("network_attempts") or 0) for event in events)
+    network_successes = sum(
+        1 for event in events
+        if int(event.get("network_attempts") or 0) > 0
+        and event.get("cache_status") != "error")
+    errors = counts.get("error", 0)
+    deferred = counts.get("deferred", 0)
+    usable_responses = sum(
+        count for status, count in counts.items()
+        if status not in {"error", "deferred", "unknown"})
+    successes = sorted(
+        str(event["last_network_success_at"])
+        for event in events if event.get("last_network_success_at"))
+    if (errors or deferred) and usable_responses:
+        source_status = "partial"
+    elif errors:
+        source_status = "error"
+    elif network_successes:
+        source_status = "ok"
+    elif counts.get("stale_backoff"):
+        source_status = "stale"
+    elif counts.get("deferred"):
+        source_status = "deferred"
+    elif events:
+        source_status = "cached"
+    else:
+        source_status = "ok"
+    return {
+        "source_status": source_status,
+        "network_attempts": attempts,
+        "network_successes": network_successes,
+        "network_errors": errors,
+        "usable_responses": usable_responses,
+        "cache_statuses": counts,
+        "last_network_success_at": successes[-1] if successes else None,
+    }
+
+
+class ResponseValidationError(requests.RequestException):
+    """A nominally successful response is not parseable as the requested format."""
+
+
+def validate_http_response(response, response_kind):
+    if response_kind == "json":
+        try:
+            response.json()
+        except ValueError as error:
+            raise ResponseValidationError("HTTP 200 正文不是有效 JSON") from error
+    elif response_kind == "xml":
+        try:
+            ET.fromstring(response.content)
+        except ET.ParseError as error:
+            raise ResponseValidationError("HTTP 200 正文不是有效 XML") from error
+
+
+def http_get(url, accept=None, *, source=None, cache_root=None, now=None,
+             logical_day=None, force_revalidate=None, response_kind=None):
+    """GET with persistent validators, bounded freshness reuse, and hard Reddit gate.
+
+    Cached responses are normal ``requests.Response`` objects, so fetchers keep
+    parsing exactly the same bytes.  Every actual network attempt still calls
+    ``reserve_request``; a cache hit performs no Reddit request and consumes no slot.
+    """
+    cache_root = Path(cache_root) if cache_root is not None else HTTP_CACHE_ROOT
+    force_revalidate = (HTTP_FORCE_REVALIDATE if force_revalidate is None
+                        else force_revalidate)
+    logical_day = logical_day or HTTP_LOGICAL_DAY
+    prepare_kwargs = {
+        "source": source, "now": now, "logical_day": logical_day,
+        "force_revalidate": force_revalidate,
+    }
+    prepared = prepare_request(cache_root, url, accept, **prepare_kwargs)
+    ready = _prepared_response(
+        url, prepared, cache_root, now, logical_day, response_kind)
+    if ready is not None:
+        return ready
+    try:
+        with request_lease(cache_root, prepared.key) as key_lease:
+            # Another process may have completed the same request while this one
+            # waited for the lease.  Re-read state before touching the network.
+            refreshed_kwargs = dict(prepare_kwargs)
+            if key_lease:
+                # A completed identical forced revalidation satisfies this waiter.
+                refreshed_kwargs["force_revalidate"] = False
+            prepared = prepare_request(cache_root, url, accept, **refreshed_kwargs)
+            ready = _prepared_response(
+                url, prepared, cache_root, now, logical_day, response_kind)
+            if ready is not None:
+                return ready
+            return _network_http_get(
+                url, accept, source, cache_root, now, logical_day, prepared,
+                key_lease, response_kind)
+    except FetchCooldown as error:
+        if not (_HTTP_EVENTS and _HTTP_EVENTS[-1].get("url") == url
+                and _HTTP_EVENTS[-1].get("cache_status") == "deferred"):
+            _HTTP_EVENTS.append({
+                "url": url, "cache_status": "deferred", "network_attempts": 0,
+                "error": type(error).__name__,
+            })
+        raise
+
+
+def _prepared_response(url, prepared, cache_root, now, logical_day, response_kind):
+    if prepared.cached_response is not None:
+        try:
+            validate_http_response(prepared.cached_response, response_kind)
+        except ResponseValidationError as error:
+            discard_cached_response(
+                cache_root, prepared, now=now, logical_day=logical_day,
+                error=f"{type(error).__name__}: {error}")
+            return None
+        _HTTP_EVENTS.append({
+            "url": url,
+            "cache_status": prepared.cached_response.frontier_cache_status,
+            "network_attempts": 0,
+            "last_network_success_at": getattr(
+                prepared.cached_response, "frontier_last_network_success_at", None),
+        })
+        return prepared.cached_response
+    if prepared.deferred_until:
+        _HTTP_EVENTS.append({
+            "url": url, "cache_status": "deferred", "network_attempts": 0,
+            "retry_at": prepared.deferred_until,
+        })
+        raise FetchCooldown(
+            f"请求仍在失败冷却期（至 {prepared.deferred_until}）"
+            + (f"：{prepared.deferred_error}" if prepared.deferred_error else ""))
+    return None
+
+
+def _sleep_with_lease_heartbeat(seconds, *leases):
+    remaining = max(0.0, float(seconds))
+    while remaining:
+        for lease in leases:
+            lease.heartbeat()
+        chunk = min(60.0, remaining)
+        time.sleep(chunk)
+        remaining -= chunk
+    for lease in leases:
+        lease.heartbeat()
+
+
+def _network_http_get(url, accept, source, cache_root, now, logical_day, prepared,
+                      key_lease, response_kind):
     headers = {"User-Agent": UA}
     if accept:
         headers["Accept"] = accept
+    headers.update(prepared.headers)
+    attempts = 0
+    retry_after_observed = 0
+    retry_after_waited = 0
+    resp = None
+    retried_429 = False
+
+    delay_before = max(0.0, float((source or {}).get("delay_before") or 0))
+    if delay_before and not is_reddit_url(url):
+        # Apply source pacing only after cache/cooldown checks prove that this
+        # invocation will really touch the network. Reddit uses only its shared
+        # hard gate, so a disabled policy can never be preceded by this delay.
+        _sleep_with_lease_heartbeat(delay_before, key_lease)
+
+    def request_hop(request_url, request_headers):
+        nonlocal attempts, retry_after_observed, retry_after_waited, retried_429
+        with request_lease(cache_root, host_lease_key(request_url)) as host_lease:
+            blocked_until, blocked_error = host_cooldown(
+                cache_root, request_url, now=now)
+            if blocked_until:
+                raise FetchCooldown(
+                    f"同一源站仍在冷却期（至 {blocked_until}）：{blocked_error}")
+
+            def gated_request():
+                nonlocal attempts
+                reserve_request(
+                    request_url,
+                    sleep_fn=lambda seconds: _sleep_with_lease_heartbeat(
+                        seconds, key_lease, host_lease))
+                attempts += 1
+                return requests.get(
+                    request_url, headers=request_headers, timeout=TIMEOUT,
+                    allow_redirects=False)
+
+            try:
+                response = gated_request()
+            except (requests.ConnectionError, requests.Timeout):
+                # 部分公开 feed 偶发在 TLS 握手或首包阶段断开；一次短重试即可区分瞬时故障与持续阻断。
+                _sleep_with_lease_heartbeat(1, key_lease, host_lease)
+                response = gated_request()
+            if response.status_code == 429 and not retried_429:
+                wait = retry_after_seconds(response.headers, now) or 30
+                retry_after_observed = max(retry_after_observed, wait)
+                retried_429 = True
+                if wait <= 60:
+                    _sleep_with_lease_heartbeat(wait, key_lease, host_lease)
+                    retry_after_waited += wait
+                    response = gated_request()
+                    if response.status_code == 429:
+                        retry_after_observed = max(
+                            retry_after_observed,
+                            retry_after_waited
+                            + (retry_after_seconds(response.headers, now) or 30))
+            if response.status_code in {429, 503}:
+                final_retry_after = max(
+                    retry_after_observed,
+                    retry_after_waited
+                    + retry_after_seconds(response.headers, now))
+                if final_retry_after:
+                    record_host_cooldown(
+                        cache_root, request_url,
+                        retry_after=final_retry_after, now=now,
+                        error=f"HTTP {response.status_code}")
+            return response
+
+    def request_chain(start_url, initial_headers):
+        current_url = start_url
+        current_headers = dict(initial_headers)
+        history = []
+        for redirect_count in range(6):
+            response = request_hop(current_url, current_headers)
+            location = response.headers.get("Location")
+            if response.status_code not in {301, 302, 303, 307, 308}:
+                response.history = history
+                return response
+            if not location:
+                raise requests.HTTPError(
+                    f"重定向响应缺少 Location：{current_url}", response=response)
+            if redirect_count >= 5:
+                raise requests.TooManyRedirects(
+                    f"重定向超过 5 跳：{url}", response=response)
+            history.append(response)
+            current_url = urljoin(response.url or current_url, location)
+            if urlsplit(current_url).scheme.lower() not in {"http", "https"}:
+                raise requests.InvalidURL(f"不支持的重定向目标：{current_url}")
+            # Validators describe the original selected representation and must
+            # not leak to or incorrectly validate a redirect target.
+            current_headers.pop("If-None-Match", None)
+            current_headers.pop("If-Modified-Since", None)
+        raise requests.TooManyRedirects(f"重定向超过 5 跳：{url}")
+
     try:
-        resp = requests.get(url, headers=headers, timeout=TIMEOUT)
-    except (requests.ConnectionError, requests.Timeout):
-        # 部分公开 feed 偶发在 TLS 握手或首包阶段断开；一次短重试即可区分瞬时故障与持续阻断。
-        time.sleep(1)
-        resp = requests.get(url, headers=headers, timeout=TIMEOUT)
-    if resp.status_code == 429:  # 限流：按 Retry-After（上限 60s）退避一次
-        wait = min(int(resp.headers.get("Retry-After", 30) or 30), 60)
-        time.sleep(wait)
-        resp = requests.get(url, headers=headers, timeout=TIMEOUT)
-    resp.raise_for_status()
-    return resp
+        resp = request_chain(url, headers)
+        # 元数据尚在但不可变 body 被清理时，304 无法还原响应；只在这种损坏场景无条件补取一次。
+        if resp.status_code == 304:
+            restored = store_success(
+                cache_root, prepared, resp, source=source, now=now,
+                logical_day=logical_day)
+            if restored is None:
+                headers.pop("If-None-Match", None)
+                headers.pop("If-Modified-Since", None)
+                resp = request_chain(url, headers)
+            else:
+                resp = restored
+        if getattr(resp, "frontier_cache_status", "") != "revalidated":
+            resp.raise_for_status()
+            try:
+                validate_http_response(resp, response_kind)
+            except ResponseValidationError as error:
+                discard_cached_response(
+                    cache_root, prepared, now=now, logical_day=logical_day,
+                    error=f"{type(error).__name__}: {error}")
+                raise
+            resp = store_success(
+                cache_root, prepared, resp, source=source, now=now,
+                logical_day=logical_day)
+        else:
+            try:
+                validate_http_response(resp, response_kind)
+            except ResponseValidationError as error:
+                discard_cached_response(
+                    cache_root, prepared, now=now, logical_day=logical_day,
+                    error=f"{type(error).__name__}: {error}")
+                headers.pop("If-None-Match", None)
+                headers.pop("If-Modified-Since", None)
+                resp = request_chain(url, headers)
+                resp.raise_for_status()
+                validate_http_response(resp, response_kind)
+                resp = store_success(
+                    cache_root, prepared, resp, source=source, now=now,
+                    logical_day=logical_day)
+        _HTTP_EVENTS.append({
+            "url": url,
+            "cache_status": getattr(resp, "frontier_cache_status", "network"),
+            "network_attempts": attempts,
+            "last_network_success_at": getattr(
+                resp, "frontier_last_network_success_at", None),
+        })
+        return resp
+    except FetchCooldown:
+        raise
+    except Exception as error:
+        status_code = getattr(resp, "status_code", None)
+        validation_error = isinstance(error, ResponseValidationError)
+        retryable = (validation_error or status_code is None or status_code in {
+            408, 425, 429, 500, 502, 503, 504})
+        allow_stale = (not validation_error and (
+            status_code is None or status_code in {500, 502, 503, 504}))
+        retry_after = max(
+            retry_after_observed,
+            (retry_after_waited
+             + retry_after_seconds(getattr(resp, "headers", {}), now))
+            if resp is not None else 0)
+        record_failure(
+            cache_root, prepared, source=source, now=now,
+            logical_day=logical_day, retry_after=retry_after,
+            retryable=retryable, allow_stale=allow_stale,
+            error=f"{type(error).__name__}: {error}",
+            host_url=getattr(resp, "url", None) or url)
+        _HTTP_EVENTS.append({
+            "url": url, "cache_status": "error",
+            "network_attempts": attempts, "error": type(error).__name__,
+        })
+        raise
 
 
 def strip_tags(html):
@@ -143,7 +460,8 @@ def parse_feed(content):
 
 
 def fetch_rss(src):
-    resp = http_get(src["url"], accept="application/rss+xml, application/atom+xml, application/xml, text/xml")
+    resp = http_get(src["url"], accept="application/rss+xml, application/atom+xml, application/xml, text/xml",
+                    source=src, response_kind="xml")
     items = parse_feed(resp.content)
     for it in items:
         full = it.pop("_fulltext", "") or it.get("summary") or ""
@@ -161,7 +479,7 @@ def fetch_rss(src):
             if it.get("x_links") or not it.get("url"):
                 continue
             try:
-                it["x_links"] = mine_x_links(http_get(it["url"]).text)
+                it["x_links"] = mine_x_links(http_get(it["url"], source=src).text)
             except Exception:
                 pass  # 单页失败不影响信源整体
     return items
@@ -181,7 +499,9 @@ def iter_query_json(src, build_url, accept=None):
             time.sleep(delay)
         try:
             # .json() 必须在 try 内：requests 的 JSONDecodeError 同时继承 ValueError
-            yield q, http_get(build_url(q), accept=accept).json()
+            yield q, http_get(
+                build_url(q), accept=accept, source=src,
+                response_kind="json").json()
         except (requests.RequestException, ValueError) as e:
             print(f"[warn] {src.get('id', '?')} 检索词 {q!r} 失败"
                   f"（{type(e).__name__}），跳过该词", flush=True)
@@ -215,7 +535,7 @@ def fetch_hn(src):
 
 
 def fetch_hf_models(src):
-    resp = http_get(src["url"])
+    resp = http_get(src["url"], source=src, response_kind="json")
     items = []
     for m in resp.json():
         mid = m.get("id") or m.get("modelId") or ""
@@ -229,7 +549,7 @@ def fetch_hf_models(src):
 
 
 def fetch_hf_papers(src):
-    resp = http_get(src["url"])
+    resp = http_get(src["url"], source=src, response_kind="json")
     items = []
     for p in resp.json():
         paper = p.get("paper", p)
@@ -244,7 +564,9 @@ def fetch_hf_papers(src):
 
 
 def fetch_github_repos(src):
-    resp = http_get(src["url"], accept="application/vnd.github+json")
+    resp = http_get(
+        src["url"], accept="application/vnd.github+json", source=src,
+        response_kind="json")
     items = []
     for r in resp.json():
         items.append({
@@ -322,7 +644,7 @@ def fetch_html_stub(src):
     只在首次发现或恢复时进入简报，不能被表述成价格/发布变化。官方 Markdown 端点
     可声明 content_format=markdown，保留组件属性中的表格数据，不按 HTML 标签剥离。
     """
-    resp = http_get(src["url"])
+    resp = http_get(src["url"], source=src)
     if resp.encoding in (None, "ISO-8859-1"):  # 无 charset 头时 requests 默认 latin-1，中文站会乱码
         resp.encoding = resp.apparent_encoding or "utf-8"
     if src.get("content_format") == "markdown":
@@ -411,7 +733,8 @@ def fetch_github_search(src):
 
 def fetch_yahoo_chart(src):
     """港股/美股行情（Yahoo chart API）→ 单条行情条目。"""
-    res = http_get(src["url"]).json()["chart"]["result"][0]
+    res = http_get(
+        src["url"], source=src, response_kind="json").json()["chart"]["result"][0]
     meta = res["meta"]
     sym = meta.get("symbol", "")
     price = meta.get("regularMarketPrice")
@@ -432,7 +755,7 @@ def fetch_yahoo_chart(src):
 
 def fetch_statuspage(src):
     """statuspage.io 标准 summary.json → 每个未解决事故一条；全绿则 0 条（不是错误）。"""
-    d = http_get(src["url"]).json()
+    d = http_get(src["url"], source=src, response_kind="json").json()
     items = []
     for inc in d.get("incidents", []):
         upd = (inc.get("incident_updates") or [{}])[0].get("body", "")
@@ -456,7 +779,8 @@ def fetch_statuspage(src):
 def fetch_openrouter_prices(src):
     """OpenRouter 全模型牌价 → 与上次基线 diff，只报变动/新上架（首跑建基线）。
     只追踪命中 topics.yaml model_keywords 的模型。"""
-    data = http_get(src["url"]).json().get("data", [])
+    data = http_get(
+        src["url"], source=src, response_kind="json").json().get("data", [])
     kws = [k.lower() for k in src.get("_model_keywords", [])]
     tracked = {}
     for m in data:
@@ -627,7 +951,9 @@ def diff_genai_price_snapshots(previous, current, published):
 
 def fetch_genai_prices(src):
     """pydantic/genai-prices v2 → tracked structured-price diff."""
-    data = http_get(src["url"], accept="application/json").json()
+    data = http_get(
+        src["url"], accept="application/json", source=src,
+        response_kind="json").json()
     snapshot = extract_genai_price_snapshot(
         data, src.get("_model_keywords") or [])
     state = load_state("genai_prices")
@@ -649,7 +975,7 @@ def fetch_genai_prices(src):
 def fetch_codexradar(src):
     """CodexRadar 每日固定任务集（112 任务/档）。IQ 相比上次变动超阈值的档位逐条报告；
     另出一条当日快照。数据仅私有研究引用，不再分发（见其 README 授权说明）。"""
-    d = http_get(src["url"]).json()
+    d = http_get(src["url"], source=src, response_kind="json").json()
     pts = d.get("points") or []
     updated = d.get("source_updated_at") or datetime.now(timezone.utc).isoformat()
     state = load_state("codexradar")
@@ -727,11 +1053,17 @@ def prune_raw(keep_days, today):
 
 
 def main():
+    global HTTP_FORCE_REVALIDATE, HTTP_LOGICAL_DAY
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", default=date.today().isoformat())
     ap.add_argument("--keep-days", type=int, default=45, help="data/raw 保留天数（默认 45）")
     ap.add_argument("--only", default="", help="只抓这些信源（逗号分隔的 id，测试用）")
+    ap.add_argument(
+        "--refresh-http", action="store_true",
+        help="忽略本地新鲜期并立即向源站复核；仍发送条件头，且不能绕过 Reddit 硬闸门")
     args = ap.parse_args()
+    HTTP_FORCE_REVALIDATE = args.refresh_http
+    HTTP_LOGICAL_DAY = args.date
     only = {s.strip() for s in args.only.split(",") if s.strip()}
 
     cfg = yaml.safe_load((ROOT / "config" / "sources.yaml").read_text(encoding="utf-8"))
@@ -742,7 +1074,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     log = {"date": args.date, "fetched_at": datetime.now(timezone.utc).isoformat(), "sources": {}}
-    ok = failed = 0
+    ok = partial = failed = 0
     for src in cfg["sources"]:
         if only and src["id"] not in only:
             continue
@@ -755,15 +1087,15 @@ def main():
                 (topics_cfg.get("model_keywords") or []) + src.get("queries_extra", [])))
         if src["type"] in ("openrouter_prices", "genai_prices"):
             src["_model_keywords"] = topics_cfg.get("model_keywords") or []
-        if src.get("delay_before"):  # 同域信源限流（如 Reddit 连续请求 429）
-            time.sleep(src["delay_before"])
         fetcher = FETCHERS.get(src["type"])
         if fetcher is None:
             log["sources"][src["id"]] = {"status": "error", "error": f"unknown type {src['type']}"}
             failed += 1
             continue
         try:
+            take_http_events()  # 清除上一个信源的请求观察
             items = fetcher(src)
+            http_summary = summarize_http_events(take_http_events())
             kif = src.get("keep_if_contains")  # 高频低信噪信源（如 llama.cpp CI 构建）按关键词过滤
             if kif:
                 items = [it for it in items
@@ -773,15 +1105,35 @@ def main():
                 "source": src["id"], "name": src["name"], "tier": src["tier"],
                 "injection_warning": src.get("injection_warning", False),
                 "fetched_at": datetime.now(timezone.utc).isoformat(),
+                "retrieval": {
+                    key: value for key, value in http_summary.items()
+                    if key != "source_status"
+                },
                 "items": items,
             }
             (out_dir / f"{src['id']}.json").write_text(
                 json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
-            log["sources"][src["id"]] = {"status": "ok", "items": len(items)}
-            print(f"[ok]   {src['id']}: {len(items)} items")
-            ok += 1
+            source_status = http_summary["source_status"]
+            log["sources"][src["id"]] = {
+                "status": source_status, "items": len(items),
+                "http": payload["retrieval"],
+            }
+            label = {
+                "cached": "cache", "stale": "stale", "deferred": "defer",
+                "partial": "part", "error": "fail",
+            }.get(source_status, "ok")
+            print(f"[{label:<5}] {src['id']}: {len(items)} items")
+            if source_status == "error":
+                failed += 1
+            elif source_status == "partial":
+                partial += 1
+            else:
+                ok += 1
         except Exception as e:
+            events = take_http_events()
             log["sources"][src["id"]] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+            if events:
+                log["sources"][src["id"]]["http"] = summarize_http_events(events)
             print(f"[fail] {src['id']}: {type(e).__name__}: {e}")
             failed += 1
 
@@ -791,8 +1143,13 @@ def main():
         pruned = prune_raw(args.keep_days, args.date)
         if pruned:
             print(f"已清理 {len(pruned)} 个过期 raw 目录：{', '.join(pruned)}")
-    print(f"\n{ok} ok, {failed} failed -> {out_dir}")
-    return 0 if ok > 0 else 1
+        cache_pruned = prune_cache(HTTP_CACHE_ROOT, max_age_days=args.keep_days)
+        if any(cache_pruned.values()):
+            print("已清理 HTTP 缓存："
+                  f"{cache_pruned['removed_entries']} 个过期索引、"
+                  f"{cache_pruned['removed_bodies']} 个孤儿正文")
+    print(f"\n{ok} ok, {partial} partial, {failed} failed -> {out_dir}")
+    return 0 if ok + partial > 0 else 1
 
 
 if __name__ == "__main__":

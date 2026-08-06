@@ -563,7 +563,15 @@ def main():
     if fetch_log.exists():
         log = json.loads(fetch_log.read_text(encoding="utf-8"))
         failed = [k for k, v in log["sources"].items() if v.get("status") == "error"]
-        lines.append(f"> 信源：{sum(1 for v in log['sources'].values() if v.get('status') == 'ok')} 个成功"
+        partial = [k for k, v in log["sources"].items() if v.get("status") == "partial"]
+        cached = sum(1 for v in log["sources"].values() if v.get("status") == "cached")
+        stale = sum(1 for v in log["sources"].values() if v.get("status") == "stale")
+        deferred = sum(1 for v in log["sources"].values() if v.get("status") == "deferred")
+        lines.append(f"> 信源：{sum(1 for v in log['sources'].values() if v.get('status') == 'ok')} 个联网成功"
+                     + (f"，缓存复用 {cached} 个" if cached else "")
+                     + (f"，失败冷却复用 {stale} 个" if stale else "")
+                     + (f"，冷却未请求 {deferred} 个" if deferred else "")
+                     + (f"，部分成功：{', '.join(partial)}" if partial else "")
                      + (f"，失败：{', '.join(failed)}" if failed else "") + f"；命中条目 {len(all_hits)} 条。")
         lines.append("")
 

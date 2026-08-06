@@ -15,6 +15,9 @@ import audit_reddit_sources as audit  # noqa: E402
 CONFIG = {
     "audit": {
         "duration_days": 14,
+        "max_subreddits_per_run": 2,
+        "max_requests_per_day": 2,
+        "request_delay_seconds": 0,
         "signal_match_window_days": 30,
         "direct_evidence_domains": ["github.com", "arxiv.org"],
         "technical_marker_groups": {
@@ -105,7 +108,7 @@ class RedditAuditTest(unittest.TestCase):
             self.assertIn("不改变正式日报信源", path.read_text(encoding="utf-8"))
             self.assertEqual(next(r for r in rows if r["name"] == "Technical")["unique_posts"], 1)
 
-    def test_partial_collection_preserves_existing_log_entries(self):
+    def test_daily_budget_preserves_existing_log_and_skips_extra_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             raw_root = Path(tmp)
             day_dir = raw_root / "2026-08-05"
@@ -115,17 +118,45 @@ class RedditAuditTest(unittest.TestCase):
                             "sources": {"r_previous": {"status": "ok", "items": 3}}}),
                 encoding="utf-8")
             old = audit.collect_one
-            audit.collect_one = lambda entry, cfg, limit: {
-                "source": "r_technical", "subreddit": "Technical", "category": "research",
-                "role": "candidate", "fetched_at": "2026-08-05T12:00:00+00:00", "items": []}
+            calls = []
+            audit.collect_one = lambda *args: calls.append(args)
             try:
                 log = audit.collect(CONFIG, "2026-08-05", only={"technical"}, delay=0,
                                     raw_root=raw_root)
             finally:
                 audit.collect_one = old
             self.assertIn("r_previous", log["sources"])
-            self.assertIn("r_technical", log["sources"])
+            self.assertNotIn("r_technical", log["sources"])
+            self.assertEqual(calls, [])
             self.assertEqual(log["started_at"], "earlier")
+
+    def test_default_collection_rotates_small_non_overlapping_batches(self):
+        entries = [{"name": f"S{i}"} for i in range(6)]
+        batches = [audit.rotating_batch(entries, f"2026-08-0{day}", 2)
+                   for day in (5, 6, 7)]
+        names = [{entry["name"] for entry in batch} for batch in batches]
+        self.assertTrue(all(len(batch) == 2 for batch in names))
+        self.assertEqual(set.union(*names), {f"S{i}" for i in range(6)})
+
+    def test_same_day_success_is_not_requested_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_root = Path(tmp)
+            day_dir = raw_root / "2026-08-05"
+            day_dir.mkdir()
+            (day_dir / "r_technical.json").write_text(json.dumps({
+                "source": "r_technical", "subreddit": "Technical", "status": "ok",
+                "fetched_at": "2026-08-05T12:00:00+00:00", "items": [],
+            }), encoding="utf-8")
+            calls = []
+            old = audit.collect_one
+            audit.collect_one = lambda *args: calls.append(args)
+            try:
+                log = audit.collect(CONFIG, "2026-08-05", only={"technical"}, delay=0,
+                                    raw_root=raw_root)
+            finally:
+                audit.collect_one = old
+            self.assertEqual(calls, [])
+            self.assertEqual(log["selected_sources"], [])
 
     def test_failed_attempt_is_persisted_and_counts_toward_window(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -147,7 +178,7 @@ class RedditAuditTest(unittest.TestCase):
             self.assertEqual(row["attempt_days"], 1)
             self.assertEqual(row["score"], 0)
 
-    def test_retry_failure_does_not_replace_same_day_success(self):
+    def test_same_day_success_is_kept_without_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
             raw_root = Path(tmp)
             day_dir = raw_root / "2026-08-05"
@@ -159,7 +190,8 @@ class RedditAuditTest(unittest.TestCase):
             path = day_dir / "r_technical.json"
             path.write_text(json.dumps(success), encoding="utf-8")
             old = audit.collect_one
-            audit.collect_one = lambda *args: (_ for _ in ()).throw(RuntimeError("retry failed"))
+            calls = []
+            audit.collect_one = lambda *args: calls.append(args)
             try:
                 log = audit.collect(CONFIG, "2026-08-05", only={"technical"}, delay=0,
                                     raw_root=raw_root)
@@ -168,7 +200,7 @@ class RedditAuditTest(unittest.TestCase):
             kept = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(kept["items"], [{"title": "kept"}])
             self.assertEqual(log["sources"]["r_technical"]["status"], "ok")
-            self.assertIn("retry_error", log["sources"]["r_technical"])
+            self.assertEqual(calls, [])
 
     def test_only_full_pool_logs_count_as_completed_days(self):
         with tempfile.TemporaryDirectory() as tmp:

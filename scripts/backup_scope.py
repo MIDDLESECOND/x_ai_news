@@ -23,6 +23,9 @@ PATHS = (
 def _excluded(rel: str, day: str) -> bool:
     return (
         rel.startswith("data/state/locks/")
+        # Rebuildable HTTP response cache may contain third-party full bodies;
+        # never copy it into the private Git backup or final artifact fingerprint.
+        or rel.startswith("data/state/http_cache/")
         or rel == "data/state/orchestrator_log.jsonl"
         or rel == f"data/state/daily_runs/{day}.json"
         or (rel.startswith("data/state/daily_runs/") and rel.endswith(".sync.json"))

@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -53,7 +54,8 @@ class FinalizeDailyTest(unittest.TestCase):
             root = self.make_root(td)
             calls = []
             first = finalize_day(root, "2026-08-05",
-                                 run_command=self.runner(root, calls))
+                                 run_command=self.runner(root, calls),
+                                 today=date(2026, 8, 5))
             self.assertEqual(first["status"], "complete")
             self.assertEqual(calls, ["build_analysis_context.py",
                                      "build_story_clusters.py",
@@ -74,14 +76,16 @@ class FinalizeDailyTest(unittest.TestCase):
 
             calls.clear()
             second = finalize_day(root, "2026-08-05",
-                                  run_command=self.runner(root, calls))
+                                  run_command=self.runner(root, calls),
+                                  today=date(2026, 8, 5))
             self.assertTrue(second["skipped"])
             self.assertNotIn("backup_private.py", calls)
 
             calls.clear()
             warned = finalize_day(
                 root, "2026-08-05",
-                run_command=self.runner(root, calls, fail_dossier=True))
+                run_command=self.runner(root, calls, fail_dossier=True),
+                today=date(2026, 8, 5))
             self.assertEqual(warned["status"], "complete_with_warnings")
             self.assertIn("backup_private.py", calls)
 
@@ -160,6 +164,9 @@ class FinalizeDailyTest(unittest.TestCase):
             (root / "playbooks/private.md").write_text("private\n", encoding="utf-8")
             (root / "data/state/locks").mkdir(parents=True)
             (root / "data/state/locks/x.lock").write_text("pid=1\n", encoding="utf-8")
+            (root / "data/state/http_cache/bodies").mkdir(parents=True)
+            (root / "data/state/http_cache/bodies/full-response.bin").write_bytes(
+                b"third-party full response")
             (root / "data/state/orchestrator_log.jsonl").write_text("live\n", encoding="utf-8")
             (root / "data/state/daily_runs").mkdir(parents=True)
             (root / "data/state/daily_runs/2026-08-05.json").write_text(
@@ -169,6 +176,7 @@ class FinalizeDailyTest(unittest.TestCase):
             manifest, _ = artifact_manifest(root, "2026-08-05")
             self.assertIn("playbooks/private.md", manifest)
             self.assertNotIn("data/state/locks/x.lock", manifest)
+            self.assertNotIn("data/state/http_cache/bodies/full-response.bin", manifest)
             self.assertNotIn("data/state/orchestrator_log.jsonl", manifest)
             self.assertNotIn("data/state/daily_runs/2026-08-05.json", manifest)
             self.assertNotIn("data/state/daily_runs/2026-08-05.sync.json", manifest)

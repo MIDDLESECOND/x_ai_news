@@ -1,0 +1,7 @@
+# Reddit 公开端点访问预算。所有直接 reddit.com 请求共用这一份硬限制；
+# 包括正式 L1、影子审计、失败后的重试，以及手工重复运行。
+# 2026-08-06：低频硬限速下仍再次触发账号强制改密，暂停全部直接访问；
+# 正式 L1 与影子审计都会在发出网络请求前被本地拒绝。
+enabled: false
+min_interval_seconds: 1800
+max_requests_per_utc_day: 2

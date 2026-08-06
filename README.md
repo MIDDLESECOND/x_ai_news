@@ -19,12 +19,17 @@ python scripts/fetch_l1.py && python scripts/build_digest.py
 - `--llm`：摘要正文由 Claude API 生成（需 `ANTHROPIC_API_KEY` 或 `ant auth login` 登录态；失败或输出被截断时自动回退机械聚合版，逐条链接的机械列表任何情况下都保留）。
 - `--window N`：只收录最近 N 天条目（默认 3，用于收敛全历史 feed）。
 - `--keep-days N`（fetch_l1）：`data/raw` 自动保留最近 N 天（默认 45）。
+- `--refresh-http`（fetch_l1）：忽略本地新鲜期并立即向源站复核；仍使用 ETag/Last-Modified 条件头，也不能绕过 Reddit 的跨进程硬闸门。
 - 无 RSS 的站点用页面快照 + 跨日内容哈希比对（`data/state/html_snapshots.json`），只有内容变化时才进简报。
+
+L1 的公开 GET 在私有 `data/state/http_cache/` 保存响应校验器和内容寻址缓存：同一逻辑日的新鲜期内复用原字节，跨日或过期后优先发送 `If-None-Match` / `If-Modified-Since`，收到 304 后继续用已验证正文。HTTP freshness 与应用检查时间分别记账；显式 `max-age`/`Expires` 只会缩短复用窗口，`no-cache`、`must-revalidate`、`no-store` 与 `Vary: *` 均禁止不当复用。默认自适应窗口为 30 分钟至 12 小时，只优化同日重复运行，不跳过次日主抓取。
+
+连续可重试失败采用指数冷却；仅网络错误及 500/502/503/504 可在 12 小时内明确标为 `stale` 复用，其他冷却记为 `deferred`。JSON/XML 正文先通过格式解析才进入可复用缓存，避免把 HTTP 200 的挑战页固化为新鲜响应。多查询信源混合成功与失败记为 `partial`，全部失败记为 `error`。429/503 的 `Retry-After` 同时阻断同一 host 的其他 URL；重定向逐跳关闭自动跟随后处理，每一跳都重新经过 host 冷却与 Reddit 硬闸门。跨进程同请求与同 host 的联网阶段分别串行，长时间限速等待会刷新带所有者令牌的请求租约。信源健康账本将联网成功、部分成功、缓存复用、失败冷却复用和冷却未请求分开统计。缓存正文按 `--keep-days` 清理，并明确排除在最终产物指纹和私有 Git 备份之外。
 
 ### Reddit 信源影子审计
 
 候选 subreddit 不直接加入正式日报。独立审计脚本按 `config/reddit_audit.yaml` 中的
-研究、Agent、MLOps、运行时、模态和泛 AI 对照组采集 `/new/.rss`，累计 14 个完整采样日比较
+研究、Agent、MLOps、运行时、模态和泛 AI 对照组低频轮换采集 `/new/.rss`，每个社区累计 14 次样本后比较
 活跃度、技术/证据文本代理、直接证据链接、跨社区重复、噪声，以及相对现有非 Reddit
 L1 的领先时间：
 
@@ -33,9 +38,12 @@ python scripts/audit_reddit_sources.py
 ```
 
 原始样本写入 `data/reddit_audit/`，日报之外的阶段报告写入
-`reports/reddit-source-audit/`；二者均为私有层。电脑关机造成的自然日空档不丢样本，最终
-报告始终读取最近 14 个完整采样日。未满 14 天只显示临时排名，不会自动修改
-`config/sources.yaml`。若当天只需重算报告，可加 `--report-only`。
+`reports/reddit-source-audit/`；二者均为私有层。休眠配置每次最多轮换 1 个社区，同一社区当天不重复。
+所有直接 Reddit 请求（正式 L1 与影子审计）共享 `config/reddit_access.yaml` 的硬限制：至少间隔
+30 分钟、UTC 日总预算 2 次，失败与重试也计数；账号安全锁定期间该入口保持关闭，临时改用
+人工触发、只读的浏览器观察。电脑关机造成的自然日空档不丢样本；未满
+14 次只显示临时排名，不会自动修改 `config/sources.yaml`。若当天只需重算报告，可加
+`--report-only`。
 
 其他日报分区使用同一套影子晋退逻辑，但按栏目采用不同质量指标：发布看官方确认与
 模型卡/权重，实测看方法学与复现材料，定价看可读价格正文，降智看诊断与多源印证，

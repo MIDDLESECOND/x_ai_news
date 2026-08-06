@@ -74,7 +74,11 @@ def collect_health(sources: list[dict], topics: dict, samples: list[dict],
             "attempt_days": 0,
             "success_days": 0,
             "failure_days": 0,
+            "partial_days": 0,
             "skipped_days": 0,
+            "cached_days": 0,
+            "stale_days": 0,
+            "deferred_days": 0,
             "last_status": None,
             "last_success_at": None,
             "raw_snapshot_days": 0,
@@ -97,15 +101,23 @@ def collect_health(sources: list[dict], topics: dict, samples: list[dict],
                 status = status_row.get("status")
                 row = health[source_id]
                 row["last_status"] = status
-                if status in ("ok", "error"):
+                if status in ("ok", "partial", "error"):
                     row["attempt_days"] += 1
                 if status == "ok":
                     row["success_days"] += 1
                     row["last_success_at"] = log.get("fetched_at") or day
                 elif status == "error":
                     row["failure_days"] += 1
+                elif status == "partial":
+                    row["partial_days"] += 1
                 elif status == "skipped":
                     row["skipped_days"] += 1
+                elif status == "cached":
+                    row["cached_days"] += 1
+                elif status == "stale":
+                    row["stale_days"] += 1
+                elif status == "deferred":
+                    row["deferred_days"] += 1
 
         sectioned, _ = build_digest.classify(
             sample["payloads"], topics, day, window_days, deduplicate_urls=False)
@@ -192,14 +204,15 @@ def render_report(payload: dict, *, days: int) -> str:
         f"- 请求窗口：最近 {days} 个自然日；实际 raw 样本日：{len(payload['sample_days'])}",
         f"- 含完整抓取日志的运行日：{payload['full_run_days']}",
         f"- 边界：{payload['boundary']}", "",
-        "| source_id | tier | 成功/尝试 | raw | 入围 | 入围率 | 唯一条目 | 故事 | 主来源 | 单源故事 |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| source_id | tier | 成功/部分/尝试 | 缓存/陈旧/冷却 | raw | 入围 | 入围率 | 唯一条目 | 故事 | 主来源 | 单源故事 |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in sorted(payload["sources"], key=lambda value: (
             value["tier"], value["source_id"])):
         lines.append(
             f"| `{row['source_id']}` | {row['tier']} | "
-            f"{row['success_days']}/{row['attempt_days']} | "
+            f"{row['success_days']}/{row['partial_days']}/{row['attempt_days']} | "
+            f"{row['cached_days']}/{row['stale_days']}/{row['deferred_days']} | "
             f"{row['raw_item_observations']} | {row['qualified_observations']} | "
             f"{_ratio(row['qualification_rate'])} | {row['unique_qualified_items']} | "
             f"{row['story_mentions']} | {row['primary_stories']} | "

@@ -7,8 +7,11 @@
 audit:
   duration_days: 14
   max_items_per_subreddit: 25
-  request_delay_seconds: 6
-  keep_days: 21
+  # 每天只轮换一个小批次；全仓库另有 config/reddit_access.yaml 的跨进程硬预算。
+  max_subreddits_per_run: 1
+  max_requests_per_day: 1
+  request_delay_seconds: 1800
+  keep_days: 240
   signal_match_window_days: 30
 
   # 这些域名只作为“直接证据链接”代理，不等同于已经核验过的原创来源。

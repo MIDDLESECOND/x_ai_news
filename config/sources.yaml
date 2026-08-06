@@ -2,7 +2,7 @@
 # type: rss | hn_algolia | hf_models | hf_papers | github_repos | reddit_rss | html_stub
 # tier: aggregator（聚合）| community（社区一手）| official（厂商口径）| index（聚合指数）| finance（财经）
 # enabled: false 的条目跳过（Phase 2 再补）。
-# 限流相关：delay_before 是抓该信源之前的等待秒数（同域信源之间，如 Reddit）；
+# 限流相关：delay_before 只在确定需要真实联网后等待；Reddit 统一走跨进程硬闸门；
 # query_delay 是按关键词收敛的信源（hn_algolia / github_search）各检索词之间的等待秒数，默认 1。
 
 sources:
@@ -228,7 +228,6 @@ sources:
     type: reddit_rss
     url: https://www.reddit.com/r/ClaudeAI/.rss
     tier: community
-    delay_before: 6           # Reddit 同域连续请求会 429
     enabled: true
 
   - id: r_chatgptcoding
@@ -236,7 +235,6 @@ sources:
     type: reddit_rss
     url: https://www.reddit.com/r/ChatGPTCoding/new/.rss
     tier: community
-    delay_before: 30
     enabled: false            # 信源枯竭（约月更，实测 2026-08-02），由 r_codex 系替代
 
   - id: r_codex
@@ -244,7 +242,6 @@ sources:
     type: reddit_rss
     url: https://www.reddit.com/r/codex/new/.rss   # OpenAI 订阅党主阵地：额度/降智风向密度极高（2026-08-02 实测半天 25 帖）
     tier: community
-    delay_before: 30          # Reddit 同域第三个请求，需长间隔
     enabled: true
 
   - id: r_openaicodex
@@ -252,7 +249,6 @@ sources:
     type: reddit_rss
     url: https://www.reddit.com/r/OpenAIcodex/new/.rss   # 与 r/codex 同社群分流，上下文缩水/额度燃烧类一手帖
     tier: community
-    delay_before: 30
     enabled: true
 
   - id: openai_devforum

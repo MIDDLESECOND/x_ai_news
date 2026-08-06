@@ -4,6 +4,7 @@ import sys
 import tempfile
 import os
 import time
+import yaml
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -20,6 +21,10 @@ STORY_CLUSTERS = ROOT / "scripts" / "build_story_clusters.py"
 SOURCE_INDEPENDENCE = ROOT / "scripts" / "build_source_independence.py"
 SOURCE_HEALTH = ROOT / "scripts" / "build_source_health.py"
 STORY_LINEAGE = ROOT / "scripts" / "build_story_lineage.py"
+REDDIT_ACCESS = ROOT / "config" / "reddit_access.yaml"
+REDDIT_AUDIT = ROOT / "config" / "reddit_audit.yaml"
+REDDIT_LIMITER = ROOT / "scripts" / "reddit_rate_limit.py"
+FETCH_L1 = ROOT / "scripts" / "fetch_l1.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from synthesis_lease import acquire_lease, release_lease  # noqa: E402
@@ -27,6 +32,21 @@ import daily_orchestrator as orchestrator  # noqa: E402
 
 
 class DailySynthesisPolicyTest(unittest.TestCase):
+    def test_reddit_access_is_hard_limited_across_collectors(self):
+        access = yaml.safe_load(REDDIT_ACCESS.read_text(encoding="utf-8"))
+        audit = yaml.safe_load(REDDIT_AUDIT.read_text(encoding="utf-8"))["audit"]
+        self.assertGreaterEqual(access["min_interval_seconds"], 1800)
+        self.assertLessEqual(access["max_requests_per_utc_day"], 2)
+        self.assertLessEqual(audit["max_subreddits_per_run"], 1)
+        self.assertLessEqual(audit["max_requests_per_day"], 1)
+        self.assertGreaterEqual(audit["request_delay_seconds"], 1800)
+        limiter = REDDIT_LIMITER.read_text(encoding="utf-8")
+        self.assertIn("max(1800", limiter)
+        self.assertIn("min(\n            2", limiter)
+        fetch_l1 = FETCH_L1.read_text(encoding="utf-8")
+        self.assertIn("reserve_request(\n                    request_url", fetch_l1)
+        self.assertIn("allow_redirects=False", fetch_l1)
+
     def read_private_prompt(self):
         if not PROMPT.exists():
             self.skipTest("private synthesis playbook is not present in this checkout")
