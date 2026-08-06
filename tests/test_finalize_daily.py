@@ -56,6 +56,10 @@ class FinalizeDailyTest(unittest.TestCase):
                                  run_command=self.runner(root, calls))
             self.assertEqual(first["status"], "complete")
             self.assertEqual(calls, ["build_analysis_context.py",
+                                     "build_story_clusters.py",
+                                     "build_source_independence.py",
+                                     "build_source_health.py",
+                                     "build_story_lineage.py",
                                      "build_report_dossiers.py",
                                      "build_monthly_claim_review.py",
                                      "backup_private.py",

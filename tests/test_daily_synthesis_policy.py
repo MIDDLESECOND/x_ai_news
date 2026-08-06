@@ -16,6 +16,10 @@ FINALIZER = ROOT / "scripts" / "finalize_daily.py"
 ANALYSIS = ROOT / "scripts" / "build_analysis_context.py"
 DOSSIERS = ROOT / "scripts" / "build_report_dossiers.py"
 MONTHLY = ROOT / "scripts" / "build_monthly_claim_review.py"
+STORY_CLUSTERS = ROOT / "scripts" / "build_story_clusters.py"
+SOURCE_INDEPENDENCE = ROOT / "scripts" / "build_source_independence.py"
+SOURCE_HEALTH = ROOT / "scripts" / "build_source_health.py"
+STORY_LINEAGE = ROOT / "scripts" / "build_story_lineage.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from synthesis_lease import acquire_lease, release_lease  # noqa: E402
@@ -70,12 +74,19 @@ class DailySynthesisPolicyTest(unittest.TestCase):
         self.assertIn('"--finalize-date", day', finalizer)
         self.assertIn('"--artifact-fingerprint", fingerprint', finalizer)
         self.assertIn('"--receipt-sync-only"', finalizer)
+        for script in ("build_story_clusters.py", "build_source_independence.py",
+                       "build_source_health.py", "build_story_lineage.py"):
+            self.assertIn(script, finalizer)
 
     def test_every_derived_writer_has_an_independent_lock(self):
         for path, lock_name in (
             (ANALYSIS, "analysis-context.lock"),
             (DOSSIERS, "report-dossiers.lock"),
             (MONTHLY, "monthly-review-"),
+            (STORY_CLUSTERS, "story-clusters.lock"),
+            (SOURCE_INDEPENDENCE, "source-independence.lock"),
+            (SOURCE_HEALTH, "source-health.lock"),
+            (STORY_LINEAGE, "story-lineage.lock"),
         ):
             with self.subTest(path=path.name):
                 text = path.read_text(encoding="utf-8")

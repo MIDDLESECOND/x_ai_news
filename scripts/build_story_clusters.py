@@ -120,6 +120,7 @@ def _public_item(item: dict) -> dict:
         "snapshot_hash": item["snapshot_hash"],
         "title": item["title"],
         "url": item["url"],
+        "external_url": item.get("external_url", ""),
         "source": item["source"],
         "source_id": str(item["source_item_id"]).rsplit(":", 1)[0],
         "tier": item["tier"],

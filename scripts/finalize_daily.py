@@ -87,19 +87,30 @@ def finalize_day(root: Path, day: str, *, run_command=None,
             context_cmd, 120)
         steps["analysis_context"] = _step_record(context)
 
-        dossiers = runner(
-            [sys.executable, "scripts/build_report_dossiers.py"], 120)
-        steps["dossiers"] = _step_record(dossiers)
-
-        monthly = runner(
-            [sys.executable, "scripts/build_monthly_claim_review.py",
-             "--as-of", day], 120)
-        steps["monthly_review"] = _step_record(monthly)
+        derived_commands = [
+            ("story_clusters", [
+                sys.executable, "scripts/build_story_clusters.py", "--date", day], 120),
+            ("source_independence", [
+                sys.executable, "scripts/build_source_independence.py", "--date", day], 120),
+            ("source_health", [
+                sys.executable, "scripts/build_source_health.py", "--date", day,
+                "--days", "30"], 180),
+            ("story_lineage", [
+                sys.executable, "scripts/build_story_lineage.py", "--date", day,
+                "--days", "30"], 180),
+            ("dossiers", [sys.executable, "scripts/build_report_dossiers.py"], 120),
+            ("monthly_review", [
+                sys.executable, "scripts/build_monthly_claim_review.py", "--as-of", day], 120),
+        ]
+        for name, command, timeout in derived_commands:
+            steps[name] = _step_record(runner(command, timeout))
+        required_steps = ("analysis_context",) + tuple(
+            name for name, _, _ in derived_commands)
+        views_ok = all(steps[name]["ok"] for name in required_steps)
 
         manifest, fingerprint = artifact_manifest(root, day)
         previous = _load_receipt(receipt_path)
-        if (not force and steps["analysis_context"]["ok"] and steps["dossiers"]["ok"]
-                and steps["monthly_review"]["ok"]
+        if (not force and views_ok
                 and previous.get("status") == "complete"
                 and previous.get("artifact_fingerprint") == fingerprint
                 and _sync_confirmed(receipt_path, marker_path)):
@@ -130,9 +141,7 @@ def finalize_day(root: Path, day: str, *, run_command=None,
             status = "backup_failed"
         elif not stable:
             status = "changed_during_backup"
-        elif (not steps["analysis_context"]["ok"]
-              or not steps["dossiers"]["ok"]
-              or not steps["monthly_review"]["ok"]):
+        elif not views_ok:
             status = "complete_with_warnings"
         else:
             status = "complete"

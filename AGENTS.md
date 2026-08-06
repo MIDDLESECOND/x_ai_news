@@ -56,6 +56,9 @@
 - `reports/dossiers/` 只机械呈现账本已有证据，带 `ledger_ref` 的职业悬案默认跳过；正式 `reports/YYYY-MM-DD-<主题>.md` 不得被自动覆盖。
 - 分类规则回放必须分别执行 Git 基线版本与工作区版本的分类器及 topics 配置，比较历史快照的召回、栏目路由和逐信源差异；不得写入悬案、状态或日报。
 - 故事聚类是确定性、可重建的阅读视图；必须保留每条底层观察的 `source_item_id` 与 `snapshot_hash`，并记录合并原因。聚为同一故事不等于多来源独立证实。
+- 来源独立性图谱中的 group 只表示规范化 origin URL 相同；不同 group 仍只是候选独立来源，不得写成多源独立证实。
+- 信源健康账本只做描述性统计，不得自动晋退或启停信源；低频官方源与高频聚合源必须分轨解释，历史 feed 的 raw 量和入围率不得直接当质量分。
+- 跨日 story lineage 只记录窗口内重复抓取、快照变化与保守后续候选；不得由此推断纠正、解决、事实成立或改写悬案。
 - genai-prices 与 OpenRouter 都是二级结构化价格索引，只用于发现候选变化；对外结论必须回到厂商原始定价页，且不得将索引元数据变化误报为价格变化。
 - 所有派生写入必须幂等、加锁并原子替换；下游 dossier 或月度复盘失败不得阻断 brief 与私有备份。
 - 最终备份只能在合成、分诊与派生刷新之后由 `scripts/finalize_daily.py` 触发；`data/state/daily_runs/<date>.json` 是本日事务完成回执，只有同目录 `.sync.json` 的回执哈希确认存在才算同步闭环。备份前后产物指纹、目标受管范围与 Git 提交树必须一致；历史日期不得覆盖全局 current 上下文。
@@ -84,6 +87,9 @@ python -m unittest discover -s tests
 python scripts/build_analysis_context.py
 python scripts/backtest_classification.py --days 14
 python scripts/build_story_clusters.py --date YYYY-MM-DD
+python scripts/build_source_independence.py --date YYYY-MM-DD
+python scripts/build_source_health.py --date YYYY-MM-DD --days 30
+python scripts/build_story_lineage.py --date YYYY-MM-DD --days 30
 python scripts/build_report_dossiers.py
 python scripts/build_monthly_claim_review.py --month YYYY-MM
 python scripts/finalize_daily.py --date YYYY-MM-DD

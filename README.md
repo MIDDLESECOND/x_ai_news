@@ -78,6 +78,16 @@ python scripts/backtest_classification.py --days 14
 python scripts/build_story_clusters.py --date YYYY-MM-DD
 ```
 
+聚类之后可继续生成三个私有派生视图：来源传播链与候选独立 origin、30 日信源健康账本、窗口内跨日故事连续性。三者都只帮助阅读和人工复查，不自动改日报、悬案或信源配置：
+
+```bash
+python scripts/build_source_independence.py --date YYYY-MM-DD
+python scripts/build_source_health.py --date YYYY-MM-DD --days 30
+python scripts/build_story_lineage.py --date YYYY-MM-DD --days 30
+```
+
+`finalize_daily.py` 会按上述依赖顺序刷新这些视图，再计算备份指纹。
+
 ### Windows 定时（Task Scheduler）
 
 ```powershell

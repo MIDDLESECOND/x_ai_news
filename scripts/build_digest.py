@@ -190,6 +190,7 @@ def classify(payloads, topics_cfg, day, window_days, *, deduplicate_urls=True):
             item = {
                 "title": it.get("title", "").strip() or url,
                 "url": url,
+                "external_url": it.get("external_url") or "",
                 "source": p["name"], "tier": p["tier"],
                 "tier_label": TIER_LABEL.get(p["tier"], p["tier"]),
                 "published": it.get("published", ""),
