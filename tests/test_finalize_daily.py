@@ -134,6 +134,38 @@ class FinalizeDailyTest(unittest.TestCase):
             self.assertEqual(retried["status"], "complete")
             self.assertEqual(calls.count("backup_private.py"), 2)
 
+    def test_derived_timeout_cannot_leave_an_old_sync_marker_valid(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = self.make_root(td)
+            finalize_day(
+                root, "2026-08-05", run_command=self.runner(root, []),
+                today=date(2026, 8, 5))
+            receipt_path = root / "data/state/daily_runs/2026-08-05.json"
+            marker_path = root / "data/state/daily_runs/2026-08-05.sync.json"
+            marker_states = []
+
+            def interrupted_runner(cmd, timeout):
+                script = Path(cmd[1]).name
+                if script == "build_story_clusters.py":
+                    marker_states.append(marker_path.exists())
+                    path = root / "data/state/story_clusters/2026-08-05.json"
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text('{"changed": true}\n', encoding="utf-8")
+                if script == "build_story_lineage.py":
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="ok", stderr="")
+
+            result = finalize_day(
+                root, "2026-08-05", run_command=interrupted_runner,
+                today=date(2026, 8, 5))
+
+            self.assertEqual(marker_states, [False])
+            self.assertEqual(result["status"], "complete_with_warnings")
+            self.assertTrue(_sync_confirmed(receipt_path, marker_path))
+            _, fingerprint = artifact_manifest(root, "2026-08-05")
+            self.assertEqual(result["artifact_fingerprint"], fingerprint)
+
     def test_historical_complete_day_skips_before_touching_current_context(self):
         from datetime import date
         with tempfile.TemporaryDirectory() as td:

@@ -567,10 +567,12 @@ def main():
         cached = sum(1 for v in log["sources"].values() if v.get("status") == "cached")
         stale = sum(1 for v in log["sources"].values() if v.get("status") == "stale")
         deferred = sum(1 for v in log["sources"].values() if v.get("status") == "deferred")
+        gone = [k for k, v in log["sources"].items() if v.get("status") == "gone"]
         lines.append(f"> 信源：{sum(1 for v in log['sources'].values() if v.get('status') == 'ok')} 个联网成功"
                      + (f"，缓存复用 {cached} 个" if cached else "")
                      + (f"，失败冷却复用 {stale} 个" if stale else "")
                      + (f"，冷却未请求 {deferred} 个" if deferred else "")
+                     + (f"，已撤下待人工复核：{', '.join(gone)}" if gone else "")
                      + (f"，部分成功：{', '.join(partial)}" if partial else "")
                      + (f"，失败：{', '.join(failed)}" if failed else "") + f"；命中条目 {len(all_hits)} 条。")
         lines.append("")

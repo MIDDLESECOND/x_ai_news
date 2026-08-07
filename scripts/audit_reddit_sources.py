@@ -22,11 +22,13 @@ import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import yaml
 
 from fetch_l1 import fetch_rss
+from reddit_audit_baseline import (load_l1_baseline, normalize_match_url,
+                                   url_signal_key)
 from state_io import atomic_write_if_changed, exclusive_lock
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -36,7 +38,6 @@ REPORT_DIR = ROOT / "reports" / "reddit-source-audit"
 AUDIT_LOCK = ROOT / "data" / "state" / "locks" / "reddit-source-audit.lock"
 URL_RE = re.compile(r"https?://[^\s<>'\"&]+", re.IGNORECASE)
 WORD_RE = re.compile(r"[a-z0-9][a-z0-9_+.-]*", re.IGNORECASE)
-TRACKING_PARAMS = {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "ref", "source"}
 SOCIAL_OR_AGGREGATOR = {
     "reddit.com", "www.reddit.com", "redd.it", "x.com", "twitter.com", "xcancel.com",
     "youtube.com", "www.youtube.com", "youtu.be", "medium.com", "news.ycombinator.com",
@@ -59,20 +60,7 @@ def subreddit_id(name):
 
 
 def normalize_url(value):
-    value = html.unescape((value or "").strip()).rstrip(".,);]}")
-    if not value.startswith(("http://", "https://")):
-        return ""
-    try:
-        parts = urlsplit(value)
-    except ValueError:
-        return ""
-    host = (parts.hostname or "").lower()
-    if not host:
-        return ""
-    query = urlencode([(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
-                       if k.lower() not in TRACKING_PARAMS])
-    path = parts.path.rstrip("/") or "/"
-    return urlunsplit(("https", host, path, query, ""))
+    return normalize_match_url(value) or ""
 
 
 def extract_urls(text):
@@ -159,16 +147,46 @@ def collect_one(entry, audit_cfg, max_items):
     }
 
 
-def rotating_batch(entries, day, limit):
-    """Select one deterministic non-overlapping batch for a calendar day."""
+def audit_attempt_history(raw_root, day):
+    """Return retained attempt counts and last-attempt days by source id."""
+    counts = defaultdict(int)
+    latest = {}
+    if not raw_root.exists():
+        return counts, latest
+    end = date.fromisoformat(day)
+    for folder in sorted(raw_root.iterdir()):
+        try:
+            sample_day = date.fromisoformat(folder.name)
+        except (ValueError, AttributeError):
+            continue
+        if sample_day > end:
+            continue
+        for path in folder.glob("r_*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            source_id = str(payload.get("source") or path.stem)
+            counts[source_id] += 1
+            latest[source_id] = max(latest.get(source_id, ""), folder.name)
+    return counts, latest
+
+
+def rotating_batch(entries, day, limit, raw_root=AUDIT_RAW):
+    """Select the least-sampled, least-recently attempted sources first."""
     entries = list(entries)
     if not entries:
         return []
     limit = max(1, min(int(limit), len(entries)))
-    batches = math.ceil(len(entries) / limit)
-    batch_index = date.fromisoformat(day).toordinal() % batches
-    start = batch_index * limit
-    return entries[start:start + limit]
+    counts, latest = audit_attempt_history(raw_root, day)
+    ranked = sorted(
+        enumerate(entries),
+        key=lambda pair: (
+            counts.get(subreddit_id(pair[1]["name"]), 0),
+            latest.get(subreddit_id(pair[1]["name"]), ""),
+            pair[0],
+        ))
+    return [entry for _, entry in ranked[:limit]]
 
 
 def collect(config, day, only=None, delay=None, raw_root=AUDIT_RAW):
@@ -177,7 +195,7 @@ def collect(config, day, only=None, delay=None, raw_root=AUDIT_RAW):
                   if not only or s["name"].lower() in only]
     batch_limit = 1
     selected = (candidates[:batch_limit] if only
-                else rotating_batch(candidates, day, batch_limit))
+                else rotating_batch(candidates, day, batch_limit, raw_root))
     day_dir = raw_root / day
     day_dir.mkdir(parents=True, exist_ok=True)
     configured_wait = max(0.0, float(audit_cfg.get("request_delay_seconds", 300)))
@@ -194,22 +212,29 @@ def collect(config, day, only=None, delay=None, raw_root=AUDIT_RAW):
         "started_at": log.get("started_at", datetime.now(timezone.utc).isoformat()),
         "sources": log.get("sources", {}),
         "policy": {
-            "selection": "explicit-capped" if only else "daily-rotation",
+            "selection": "explicit-capped" if only else "least-sampled",
             "max_subreddits_per_run": batch_limit,
             "max_requests_per_day": daily_limit,
             "request_delay_seconds": wait,
         },
     }
-    # 进程可能在逐社区原子落盘后、写汇总日志前被终止；续跑时由快照恢复成功项。
+    # 进程可能在逐社区原子落盘后、写汇总日志前被终止；任何有效快照都已占用
+    # 当天唯一尝试，续跑时必须恢复成功和失败项，不能再换一个社区请求。
     for path in day_dir.glob("r_*.json"):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
+        source_id = payload.get("source", path.stem)
         if payload.get("status", "ok") == "ok":
             # 当天已有成功快照时，后续瞬时 429/网络失败不能把日级结果降格为失败。
-            log["sources"][payload.get("source", path.stem)] = {
+            log["sources"][source_id] = {
                 "status": "ok", "items": len(payload.get("items", []))}
+        else:
+            log["sources"][source_id] = {
+                "status": "error",
+                "error": str(payload.get("error") or "snapshot error"),
+            }
     attempted_today = set(log["sources"])
     remaining = max(0, daily_limit - len(attempted_today))
     selected = [entry for entry in selected
@@ -219,14 +244,23 @@ def collect(config, day, only=None, delay=None, raw_root=AUDIT_RAW):
         if index and wait:
             time.sleep(wait)
         sid = subreddit_id(entry["name"])
+        existing_path = day_dir / f"{sid}.json"
+        atomic_write_json(existing_path, {
+            "source": sid,
+            "subreddit": entry["name"],
+            "category": entry.get("category", "uncategorized"),
+            "role": entry.get("role", "candidate"),
+            "status": "pending",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "items": [],
+        })
         try:
             payload = collect_one(entry, audit_cfg, max_items)
-            atomic_write_json(day_dir / f"{sid}.json", payload)
+            atomic_write_json(existing_path, payload)
             log["sources"][sid] = {"status": "ok", "items": len(payload["items"])}
             print(f"[ok]   r/{entry['name']}: {len(payload['items'])} items", flush=True)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
-            existing_path = day_dir / f"{sid}.json"
             try:
                 existing = json.loads(existing_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
@@ -249,23 +283,47 @@ def collect(config, day, only=None, delay=None, raw_root=AUDIT_RAW):
             print(f"[fail] r/{entry['name']}: {type(exc).__name__}: {exc}", flush=True)
     log["finished_at"] = datetime.now(timezone.utc).isoformat()
     atomic_write_json(log_path, log)
-    prune_audit(raw_root, day, audit_cfg.get("keep_days", 21))
+    prune_audit(
+        raw_root, day, retention_days(config),
+        minimum_attempts=int(audit_cfg.get("duration_days", 14)),
+        protected_sources={subreddit_id(entry["name"])
+                           for entry in config["subreddits"]})
     return log
 
 
-def prune_audit(raw_root, day, keep_days):
+def prune_audit(raw_root, day, keep_days, *, minimum_attempts=0,
+                protected_sources=None):
+    """Prune old days without dropping a configured source below its sample floor."""
     cutoff = date.fromisoformat(day) - timedelta(days=keep_days)
     if not raw_root.exists():
         return
-    for path in raw_root.iterdir():
+    protected_sources = set(protected_sources or ())
+    counts, _ = audit_attempt_history(raw_root, day)
+    for path in sorted(raw_root.iterdir()):
         if not path.is_dir():
             continue
         try:
             old = date.fromisoformat(path.name) < cutoff
         except ValueError:
             old = False
-        if old:
-            shutil.rmtree(path)
+        if not old:
+            continue
+        folder_counts = defaultdict(int)
+        for record in path.glob("r_*.json"):
+            try:
+                payload = json.loads(record.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            folder_counts[str(payload.get("source") or record.stem)] += 1
+        would_undercut = any(
+            source_id in protected_sources
+            and counts.get(source_id, 0) - removed < minimum_attempts
+            for source_id, removed in folder_counts.items())
+        if would_undercut:
+            continue
+        shutil.rmtree(path)
+        for source_id, removed in folder_counts.items():
+            counts[source_id] = max(0, counts.get(source_id, 0) - removed)
 
 
 def title_key(title):
@@ -276,13 +334,15 @@ def title_key(title):
 def item_signal_keys(item, direct_domains):
     direct = direct_evidence_urls(item, direct_domains)
     if direct:
-        return ["url:" + u for u in direct]
+        return [key for key in (url_signal_key(url) for url in direct) if key]
     key = title_key(item.get("title", ""))
     return ["title:" + key] if key else []
 
 
-def load_audit_records(raw_root, end_day, duration_days, sample_days=None):
-    start = date.fromisoformat(end_day) - timedelta(days=duration_days - 1)
+def load_audit_records(raw_root, end_day, duration_days=None, sample_days=None):
+    end = date.fromisoformat(end_day)
+    start = (end - timedelta(days=duration_days - 1)
+             if duration_days is not None else None)
     selected = set(sample_days) if sample_days is not None else None
     records = []
     if not raw_root.exists():
@@ -295,7 +355,7 @@ def load_audit_records(raw_root, end_day, duration_days, sample_days=None):
         if selected is not None:
             if folder.name not in selected:
                 continue
-        elif not (start <= sample_day <= date.fromisoformat(end_day)):
+        elif sample_day > end or (start is not None and sample_day < start):
             continue
         for path in folder.glob("r_*.json"):
             try:
@@ -343,38 +403,56 @@ def audit_sample_days(raw_root, end_day, duration_days, required_sources):
     return selected
 
 
-def existing_index(existing_raw, end_day, duration_days):
+def existing_index(existing_raw, end_day, duration_days, baseline_root=None):
     """索引当前非 Reddit L1；避免用已在正式池的同一帖子制造零领先时间。"""
     start = date.fromisoformat(end_day) - timedelta(days=duration_days + 3)
     index = defaultdict(list)
-    if not existing_raw.exists():
-        return index
-    for folder in existing_raw.iterdir():
-        try:
-            folder_day = date.fromisoformat(folder.name)
-        except (ValueError, AttributeError):
-            continue
-        if not (start <= folder_day <= date.fromisoformat(end_day)):
-            continue
-        for path in folder.glob("*.json"):
-            if path.name.startswith("_") or path.stem.startswith("r_"):
-                continue
+    if existing_raw.exists():
+        for folder in existing_raw.iterdir():
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                folder_day = date.fromisoformat(folder.name)
+            except (ValueError, AttributeError):
                 continue
-            for item in payload.get("items", []):
-                when = parse_dt(item.get("published")) or parse_dt(payload.get("fetched_at"))
-                if not when:
+            if not (start <= folder_day <= date.fromisoformat(end_day)):
+                continue
+            for path in folder.glob("*.json"):
+                if path.name.startswith("_") or path.stem.startswith("r_"):
                     continue
-                values = [item.get(k, "") for k in ("url", "external_url", "summary")]
-                values.extend(item.get("external_urls") or [])
-                urls = extract_urls(" ".join(str(value) for value in values))
-                for url in urls:
-                    index["url:" + url].append(when)
-                key = title_key(item.get("title", ""))
-                if key:
-                    index["title:" + key].append(when)
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                for item in payload.get("items", []):
+                    when = (parse_dt(item.get("published"))
+                            or parse_dt(payload.get("fetched_at")))
+                    if not when:
+                        continue
+                    values = [item.get(k, "") for k in (
+                        "url", "external_url", "summary")]
+                    values.extend(item.get("external_urls") or [])
+                    urls = extract_urls(" ".join(str(value) for value in values))
+                    for url in urls:
+                        key = url_signal_key(url)
+                        if key:
+                            index[key].append(when)
+                    key = title_key(item.get("title", ""))
+                    if key:
+                        index["title:" + key].append(when)
+    for item in load_l1_baseline(
+            baseline_root
+            or (Path(existing_raw).parent / "reddit_audit" / "l1_baseline"),
+            end_day):
+        when = parse_dt(item.get("when"))
+        if not when:
+            continue
+        for key in item.get("url_keys") or []:
+            if str(key).startswith("url-sha256:"):
+                index[str(key)].append(when)
+        key = title_key(item.get("title", ""))
+        if key:
+            index["title:" + key].append(when)
+    for key, values in list(index.items()):
+        index[key] = sorted(set(values))
     return index
 
 
@@ -536,10 +614,30 @@ def audit_window_days(config):
     return duration * sweeps + 7
 
 
+def retention_days(config):
+    """Retain enough raw attempts for every community to reach the threshold."""
+    configured = int(config.get("audit", {}).get("keep_days", 21))
+    return max(configured, audit_window_days(config))
+
+
 def generate_report(config, day, raw_root=AUDIT_RAW, existing_raw=None, report_dir=REPORT_DIR):
     duration = config["audit"].get("duration_days", 14)
-    records = load_audit_records(raw_root, day, audit_window_days(config))
-    existing = existing_index(existing_raw or ROOT / "data" / "raw", day, duration)
+    # Pruning already bounds storage while preserving at least ``duration``
+    # attempts per configured source.  Load all retained attempts because long
+    # shutdown gaps can span far more calendar days than a nominal full sweep.
+    records = load_audit_records(raw_root, day)
+    retained_days = [
+        date.fromisoformat(record["sample_day"])
+        for record in records if record.get("sample_day")]
+    comparison_days = audit_window_days(config)
+    if retained_days:
+        comparison_days = max(
+            comparison_days,
+            (date.fromisoformat(day) - min(retained_days)).days
+            + int(config["audit"].get("signal_match_window_days", 30)) + 1)
+    existing = existing_index(
+        existing_raw or ROOT / "data" / "raw", day, comparison_days,
+        baseline_root=raw_root / "l1_baseline")
     rows = score_rows(config, records, existing)
     report = render_report(config, rows, day)
     path = report_dir / f"{day}.md"

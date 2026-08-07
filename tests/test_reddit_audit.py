@@ -10,6 +10,9 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import audit_reddit_sources as audit  # noqa: E402
+import reddit_audit_baseline as baseline  # noqa: E402
+from reddit_audit_baseline import refresh_l1_baseline  # noqa: E402
+from state_io import semantic_hash  # noqa: E402
 
 
 CONFIG = {
@@ -130,13 +133,28 @@ class RedditAuditTest(unittest.TestCase):
             self.assertEqual(calls, [])
             self.assertEqual(log["started_at"], "earlier")
 
-    def test_default_collection_rotates_small_non_overlapping_batches(self):
-        entries = [{"name": f"S{i}"} for i in range(6)]
-        batches = [audit.rotating_batch(entries, f"2026-08-0{day}", 2)
-                   for day in (5, 6, 7)]
-        names = [{entry["name"] for entry in batch} for batch in batches]
-        self.assertTrue(all(len(batch) == 2 for batch in names))
-        self.assertEqual(set.union(*names), {f"S{i}" for i in range(6)})
+    def test_default_collection_remains_fair_across_calendar_gaps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_root = Path(tmp)
+            entries = [{"name": f"S{i}"} for i in range(6)]
+            first = date(2026, 1, 1)
+            selected = []
+            for run in range(18):
+                day = (first + timedelta(days=run * 10)).isoformat()
+                entry = audit.rotating_batch(
+                    entries, day, 1, raw_root=raw_root)[0]
+                selected.append(entry["name"])
+                folder = raw_root / day
+                folder.mkdir()
+                sid = audit.subreddit_id(entry["name"])
+                (folder / f"{sid}.json").write_text(json.dumps({
+                    "source": sid, "subreddit": entry["name"],
+                    "status": "ok", "items": [],
+                }), encoding="utf-8")
+
+            self.assertEqual(
+                {name: selected.count(name) for name in {entry["name"] for entry in entries}},
+                {f"S{index}": 3 for index in range(6)})
 
     def test_same_day_success_is_not_requested_again(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -177,6 +195,62 @@ class RedditAuditTest(unittest.TestCase):
             self.assertEqual(row["sample_days"], 0)
             self.assertEqual(row["attempt_days"], 1)
             self.assertEqual(row["score"], 0)
+
+    def test_error_snapshot_recovery_does_not_spend_a_second_daily_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_root = Path(tmp)
+            day_dir = raw_root / "2026-08-05"
+            day_dir.mkdir()
+            (day_dir / "r_technical.json").write_text(json.dumps({
+                "source": "r_technical", "subreddit": "Technical",
+                "status": "error", "error": "interrupted", "items": [],
+            }), encoding="utf-8")
+            calls = []
+            old = audit.collect_one
+            audit.collect_one = lambda *args: calls.append(args)
+            try:
+                log = audit.collect(
+                    CONFIG, "2026-08-05", delay=0, raw_root=raw_root)
+            finally:
+                audit.collect_one = old
+
+            self.assertEqual(calls, [])
+            self.assertEqual(log["selected_sources"], [])
+            self.assertEqual(log["sources"]["r_technical"]["status"], "error")
+
+    def test_started_snapshot_survives_base_exception_and_blocks_rerun(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_root = Path(tmp)
+            calls = []
+            old = audit.collect_one
+
+            def interrupted(entry, *_):
+                calls.append(("first", entry["name"]))
+                raise KeyboardInterrupt()
+
+            audit.collect_one = interrupted
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    audit.collect(
+                        CONFIG, "2026-08-05", delay=0, raw_root=raw_root)
+            finally:
+                audit.collect_one = old
+
+            snapshot = json.loads(
+                (raw_root / "2026-08-05/r_technical.json").read_text(
+                    encoding="utf-8"))
+            self.assertEqual(snapshot["status"], "pending")
+
+            audit.collect_one = lambda entry, *_: calls.append(
+                ("rerun", entry["name"]))
+            try:
+                log = audit.collect(
+                    CONFIG, "2026-08-05", delay=0, raw_root=raw_root)
+            finally:
+                audit.collect_one = old
+
+            self.assertEqual(calls, [("first", "Technical")])
+            self.assertEqual(log["selected_sources"], [])
 
     def test_same_day_success_is_kept_without_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -262,7 +336,205 @@ class RedditAuditTest(unittest.TestCase):
 
             index = audit.existing_index(root, "2026-08-05", 14)
 
-            self.assertIn("url:https://arxiv.org/abs/2608.00001", index)
+            self.assertIn(
+                baseline.url_signal_key("https://arxiv.org/abs/2608.00001"),
+                index)
+
+    def test_retention_covers_every_rotation_needed_for_completion(self):
+        config = {
+            "audit": {"duration_days": 14, "keep_days": 240},
+            "subreddits": [{"name": f"S{index}"} for index in range(60)],
+        }
+
+        self.assertGreaterEqual(
+            audit.retention_days(config),
+            14 * len(config["subreddits"]) + 7)
+
+    def test_pruning_preserves_minimum_attempts_across_long_gaps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_root = Path(tmp)
+            first = date(2020, 1, 1)
+            for index in range(15):
+                folder = raw_root / (first + timedelta(days=index)).isoformat()
+                folder.mkdir()
+                (folder / "r_sparse.json").write_text(json.dumps({
+                    "source": "r_sparse", "subreddit": "Sparse",
+                    "status": "ok", "items": [],
+                }), encoding="utf-8")
+
+            audit.prune_audit(
+                raw_root, "2026-08-06", 30, minimum_attempts=14,
+                protected_sources={"r_sparse"})
+
+            counts, _ = audit.audit_attempt_history(raw_root, "2026-08-06")
+            self.assertEqual(counts["r_sparse"], 14)
+
+    def test_report_uses_retained_attempts_across_long_calendar_gaps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw_root = root / "audit"
+            config = {
+                "audit": dict(CONFIG["audit"], duration_days=3),
+                "subreddits": [
+                    {"name": f"S{index}", "category": "research",
+                     "role": "candidate"}
+                    for index in range(6)
+                ],
+            }
+            first = date(2025, 1, 1)
+            for run in range(18):
+                day = (first + timedelta(days=run * 10)).isoformat()
+                entry = audit.rotating_batch(
+                    config["subreddits"], day, 1, raw_root=raw_root)[0]
+                folder = raw_root / day
+                folder.mkdir(parents=True)
+                sid = audit.subreddit_id(entry["name"])
+                (folder / f"{sid}.json").write_text(json.dumps({
+                    "source": sid, "subreddit": entry["name"],
+                    "category": "research", "role": "candidate",
+                    "status": "ok", "items": [],
+                }), encoding="utf-8")
+
+            end_day = (first + timedelta(days=170)).isoformat()
+            _, rows = audit.generate_report(
+                config, end_day, raw_root=raw_root,
+                existing_raw=root / "existing", report_dir=root / "reports")
+
+            self.assertTrue(all(row["attempt_days"] == 3 for row in rows))
+
+    def test_compact_l1_baseline_preserves_old_comparison_after_raw_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw_root = root / "audit"
+            existing_raw = root / "raw"
+            baseline_root = raw_root / "l1_baseline"
+            config = {
+                "audit": dict(CONFIG["audit"], duration_days=3),
+                "subreddits": [
+                    {"name": "Technical", "category": "research",
+                     "role": "candidate"},
+                ],
+            }
+            days = ["2026-01-01", "2026-01-11", "2026-01-21"]
+            for index, day in enumerate(days):
+                folder = raw_root / day
+                folder.mkdir(parents=True)
+                items = ([{
+                    "title": "Benchmark discussion",
+                    "url": "https://reddit.com/r/Technical/comments/a/post",
+                    "published": "2026-01-01T10:00:00+00:00",
+                    "summary": "benchmark code https://github.com/acme/eval?id=alpha",
+                }] if index == 0 else [])
+                (folder / "r_technical.json").write_text(json.dumps({
+                    "source": "r_technical", "subreddit": "Technical",
+                    "category": "research", "role": "candidate",
+                    "status": "ok", "fetched_at": f"{day}T12:00:00+00:00",
+                    "items": items,
+                }), encoding="utf-8")
+
+            official = existing_raw / "2026-01-01"
+            official.mkdir(parents=True)
+            official_path = official / "official.json"
+            official_path.write_text(json.dumps({
+                "fetched_at": "2026-01-01T13:00:00+00:00",
+                "items": [{
+                    "title": "Independent coverage",
+                    "published": "2026-01-01T11:00:00+00:00",
+                    "summary": "https://github.com/acme/eval?id=alpha",
+                }],
+            }), encoding="utf-8")
+            (official / "_fetch_log.json").write_text(json.dumps({
+                "date": "2026-01-01", "run_mode": "full",
+                "completed_at": "2026-01-01T13:01:00+00:00",
+                "sources": {"official": {
+                    "status": "ok",
+                    "snapshot_hash": semantic_hash(official_path.read_bytes()),
+                }},
+            }), encoding="utf-8")
+            refresh_l1_baseline(
+                existing_raw, baseline_root, "2026-01-21", {"official"}, 900)
+            compact = json.loads(
+                (baseline_root / "2026-01-01.json").read_text(
+                    encoding="utf-8"))
+            self.assertNotIn("summary", compact["items"][0])
+            self.assertEqual(
+                compact["items"][0]["urls"],
+                ["https://github.com/acme/eval"])
+            # The live raw window no longer contains the old day; only the
+            # compact URL/title/timestamp baseline can support the comparison.
+            official_path.unlink()
+            (official / "_fetch_log.json").unlink()
+            official.rmdir()
+            existing_raw.rmdir()
+            refresh_l1_baseline(
+                existing_raw, baseline_root, "2026-01-21", set(), 900)
+
+            _, rows = audit.generate_report(
+                config, "2026-01-21", raw_root=raw_root,
+                existing_raw=existing_raw, report_dir=root / "reports")
+
+            self.assertEqual(rows[0]["existing_matches"], 1)
+
+    def test_compact_baseline_rejects_non_urls_userinfo_and_invalid_time(self):
+        item = {
+            "url": "secret prose",
+            "external_url": "https://user:pass@example.com/private",
+            "external_urls": ["more arbitrary content"],
+            "summary": "See https://example.com/path?token=secret#part",
+        }
+
+        self.assertEqual(
+            baseline._item_urls(item), ["https://example.com/path"])
+        self.assertIsNone(baseline._safe_when("x" * 1000))
+        query_url = "https://example.com/search?id=alpha&utm_source=test"
+        self.assertEqual(
+            baseline._safe_url(query_url), "https://example.com/search")
+        self.assertEqual(
+            baseline.url_signal_key(query_url),
+            baseline.url_signal_key(audit.normalize_url(query_url)))
+
+    def test_compact_baseline_requires_full_log_and_matching_snapshot_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            day_dir = Path(tmp) / "2026-08-06"
+            day_dir.mkdir()
+            payload_path = day_dir / "official.json"
+            payload_path.write_text(json.dumps({
+                "fetched_at": "2026-08-06T12:00:00+00:00",
+                "items": [{"title": "Item", "url": "https://example.com/x"}],
+            }), encoding="utf-8")
+            (day_dir / "_fetch_log.only.json").write_text(
+                "{}", encoding="utf-8")
+            self.assertEqual(baseline.compact_l1_day(day_dir, {"official"}), [])
+
+            (day_dir / "_fetch_log.json").write_text(json.dumps({
+                "date": "2026-08-06", "run_mode": "full",
+                "completed_at": "2026-08-06T12:01:00+00:00",
+                "sources": {"official": {"snapshot_hash": "wrong"}},
+            }), encoding="utf-8")
+            self.assertEqual(baseline.compact_l1_day(day_dir, {"official"}), [])
+
+    def test_compact_baseline_retains_oldest_audit_comparison_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_root = Path(tmp) / "audit"
+            baseline_root = audit_root / "l1_baseline"
+            baseline_root.mkdir(parents=True)
+            snapshot_dir = audit_root / "2026-01-01"
+            snapshot_dir.mkdir()
+            (snapshot_dir / "r_sparse.json").write_text(json.dumps({
+                "source": "r_sparse", "subreddit": "Sparse",
+                "status": "ok", "fetched_at": "2026-01-01T12:00:00+00:00",
+                "items": [{"published": "2024-01-01T12:00:00+00:00"}],
+            }), encoding="utf-8")
+            old = baseline_root / "2023-12-02.json"
+            old.write_text('{"version": 1, "items": []}\n', encoding="utf-8")
+
+            refresh_l1_baseline(
+                Path(tmp) / "missing-raw", baseline_root,
+                "2028-08-06", set(), 900, 30, 14)
+
+            self.assertTrue(old.exists())
+            self.assertEqual(
+                baseline._subtract_days_saturated(date.min, 30), date.min)
 
 
 if __name__ == "__main__":

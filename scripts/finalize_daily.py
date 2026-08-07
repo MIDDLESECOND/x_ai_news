@@ -39,6 +39,18 @@ def _step_record(result: subprocess.CompletedProcess) -> dict:
             "note": output[-500:]}
 
 
+def _run_step(runner, command: list[str], timeout: int) -> dict:
+    """Convert command exceptions into an explicit failed derived step."""
+    try:
+        return _step_record(runner(command, timeout))
+    except Exception as exc:
+        return {
+            "ok": False,
+            "returncode": None,
+            "note": f"{type(exc).__name__}: {exc}"[-500:],
+        }
+
+
 def _load_receipt(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -77,15 +89,23 @@ def finalize_day(root: Path, day: str, *, run_command=None,
                 and _sync_confirmed(receipt_path, marker_path)):
             return dict(previous, skipped=True)
 
+        previous_sync_confirmed = (
+            previous.get("status") == "complete"
+            and _sync_confirmed(receipt_path, marker_path))
+        previous_marker = (
+            marker_path.read_bytes() if previous_sync_confirmed else None)
+        # Any derived writer may change the managed snapshot or raise midway.
+        # Invalidate the old proof before the first such command runs.  If every
+        # output remains byte-identical, the exact marker is restored below.
+        marker_path.unlink(missing_ok=True)
+
         steps = {}
         context_cmd = [sys.executable, "scripts/build_analysis_context.py", "--date", day]
         if day != current_day:
             context_cmd += [
                 "--output", str(root / "data" / "state" / "analysis_context"
                                   / f"{day}.json")]
-        context = runner(
-            context_cmd, 120)
-        steps["analysis_context"] = _step_record(context)
+        steps["analysis_context"] = _run_step(runner, context_cmd, 120)
 
         derived_commands = [
             ("story_clusters", [
@@ -103,7 +123,7 @@ def finalize_day(root: Path, day: str, *, run_command=None,
                 sys.executable, "scripts/build_monthly_claim_review.py", "--as-of", day], 120),
         ]
         for name, command, timeout in derived_commands:
-            steps[name] = _step_record(runner(command, timeout))
+            steps[name] = _run_step(runner, command, timeout)
         required_steps = ("analysis_context",) + tuple(
             name for name, _, _ in derived_commands)
         views_ok = all(steps[name]["ok"] for name in required_steps)
@@ -113,10 +133,11 @@ def finalize_day(root: Path, day: str, *, run_command=None,
         if (not force and views_ok
                 and previous.get("status") == "complete"
                 and previous.get("artifact_fingerprint") == fingerprint
-                and _sync_confirmed(receipt_path, marker_path)):
+                and previous_sync_confirmed
+                and previous_marker is not None):
+            atomic_write_if_changed(marker_path, previous_marker)
             return dict(previous, skipped=True)
 
-        marker_path.unlink(missing_ok=True)
         pending_receipt = {
             "version": 2, "date": day, "status": "backup_pending",
             "artifact_fingerprint": fingerprint, "artifacts": manifest,

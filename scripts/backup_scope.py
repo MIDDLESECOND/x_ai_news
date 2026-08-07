@@ -13,6 +13,10 @@ PATHS = (
     "briefs",
     "data/state",
     "data/candidates_ledger.json",
+    # Compact URL/title/time signals are the only durable comparison source
+    # after full raw snapshots expire; unlike HTTP cache bodies, they are safe
+    # and necessary to preserve in the private backup.
+    "data/reddit_audit/l1_baseline",
     "probes",
     "docs",
     "playbooks",
@@ -29,6 +33,9 @@ def _excluded(rel: str, day: str) -> bool:
         or rel == "data/state/orchestrator_log.jsonl"
         or rel == f"data/state/daily_runs/{day}.json"
         or (rel.startswith("data/state/daily_runs/") and rel.endswith(".sync.json"))
+        # The baseline writer's refresh lock and atomic temp files are process
+        # state, not durable comparison observations.
+        or rel.startswith("data/reddit_audit/l1_baseline/.")
         or "/.tmp-" in rel
     )
 

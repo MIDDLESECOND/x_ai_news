@@ -85,6 +85,19 @@ class SourceHealthTest(unittest.TestCase):
         self.assertEqual(rows["official"]["attempt_days"], 0)
         self.assertEqual(rows["official"]["deferred_days"], 1)
 
+    def test_gone_is_tracked_separately_from_cooldown_and_attempts(self):
+        samples = [{
+            "day": "2026-08-05", "payloads": [],
+            "log": {"fetched_at": "2026-08-05T12:00:00Z", "sources": {
+                "official": {"status": "gone"},
+            }},
+        }]
+        rows = {row["source_id"]: row for row in
+                health.collect_health(SOURCES, TOPICS, samples)["sources"]}
+        self.assertEqual(rows["official"]["attempt_days"], 0)
+        self.assertEqual(rows["official"]["deferred_days"], 0)
+        self.assertEqual(rows["official"]["gone_days"], 1)
+
     def test_partial_day_is_an_attempt_but_not_a_full_success(self):
         samples = [{
             "day": "2026-08-05", "payloads": [],

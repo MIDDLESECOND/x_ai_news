@@ -41,6 +41,7 @@ DEFAULT_POLICY = {
     # socket inactivity, so a peer can otherwise keep dribbling bytes forever.
     "max_download_seconds": 120,
 }
+MAX_HTTP_DELTA_SECONDS = 2 ** 31
 
 
 @dataclass
@@ -53,10 +54,16 @@ class PreparedRequest:
     cached_response: requests.Response | None = None
     deferred_until: str | None = None
     deferred_error: str = ""
+    terminal_status: int | None = None
+    terminal_blocked: bool = False
 
 
 class FetchCooldown(requests.RequestException):
     """A prior retryable failure is still inside its recorded cooldown."""
+
+
+class FetchGone(FetchCooldown):
+    """The origin explicitly marked this resource gone until manual review."""
 
 
 @dataclass
@@ -294,6 +301,14 @@ def prepare_request(root: Path, url: str, accept: str | None = None, *,
     prepared = PreparedRequest(key, url, accept or "", entry, {})
     body_exists = _cached_body(root, entry) is not None
 
+    if usable_gone_tombstone(entry, now=now):
+        prepared.terminal_status = 410
+        if not force_revalidate:
+            prepared.terminal_blocked = True
+            prepared.deferred_error = str(
+                entry.get("last_error") or "源站已返回 HTTP 410 Gone")
+            return prepared
+
     host_entry = load_entry(root, host_state_key(url))
     host_blocked_until = _parse_time(host_entry.get("blocked_until"))
     if host_blocked_until and now < host_blocked_until:
@@ -316,12 +331,16 @@ def prepare_request(root: Path, url: str, accept: str | None = None, *,
     next_check_at = _parse_time(
         entry.get("next_check_at") or entry.get("next_fetch_at"))
     last_checked_at = _parse_time(entry.get("last_checked_at"))
-    if next_check_at and last_checked_at:
-        # Re-evaluate with the current source policy so a configuration tightening
-        # takes effect immediately instead of inheriting an old absolute deadline.
-        current_cap = last_checked_at + timedelta(seconds=_schedule_interval_seconds(
-            policy, int(entry.get("unchanged_streak") or 0)))
-        next_check_at = min(next_check_at, current_cap)
+    schedule_base = _parse_time(entry.get("last_success_at")) or last_checked_at
+    if next_check_at and schedule_base:
+        # Recompute from the current policy.  Keeping the earlier of the stored
+        # and recomputed deadlines would honor loosening but defeat tightening.
+        # Base this on the last successful representation, because a later 4xx
+        # check must not accidentally become a fresh-cache polling delay.
+        next_check_at = _deadline_after(
+            schedule_base,
+            _schedule_interval_seconds(
+                policy, int(entry.get("unchanged_streak") or 0)))
     fresh_until = _parse_time(entry.get("fresh_until"))
     within_http_freshness = fresh_until is None or now < fresh_until
     has_redirect_memory = bool(entry.get("permanent_redirect_url"))
@@ -354,16 +373,51 @@ def _cache_control(headers) -> dict:
     return directives
 
 
+def _delta_seconds(value) -> int | None:
+    if (not isinstance(value, str) or not value.isascii()
+            or not value.isdigit()):
+        return None
+    normalized = value.lstrip("0") or "0"
+    maximum = str(MAX_HTTP_DELTA_SECONDS)
+    if (len(normalized) > len(maximum)
+            or (len(normalized) == len(maximum) and normalized > maximum)):
+        return MAX_HTTP_DELTA_SECONDS
+    return int(normalized)
+
+
+def _max_age_seconds(headers) -> tuple[bool, bool, int | None]:
+    """Return (present, valid, seconds) for one strict max-age directive."""
+    candidates = []
+    for raw_token in _header(headers, "Cache-Control").split(","):
+        token = raw_token.strip()
+        if not token:
+            continue
+        key, separator, value = token.partition("=")
+        if key.strip().lower() == "max-age":
+            candidates.append((key, separator, value))
+    if not candidates:
+        return False, True, None
+    if len(candidates) != 1:
+        return True, False, None
+    key, separator, value = candidates[0]
+    if key.lower() != "max-age" or separator != "=":
+        return True, False, None
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        value = value[1:-1]
+    seconds = _delta_seconds(value)
+    return True, seconds is not None, seconds
+
+
 def _explicit_freshness_seconds(headers, now: datetime) -> int | None:
     directives = _cache_control(headers)
     if "no-cache" in directives:
         return 0
-    try:
-        if "max-age" in directives:
-            age = max(0, int(_header(headers, "Age") or 0))
-            return max(0, int(directives["max-age"]) - age)
-    except (TypeError, ValueError):
-        pass
+    max_age_present, valid_max_age, lifetime = _max_age_seconds(headers)
+    if max_age_present:
+        age = _delta_seconds(_header(headers, "Age") or "0")
+        if not valid_max_age or lifetime is None or age is None:
+            return 0
+        return max(0, lifetime - age)
     expires = _header(headers, "Expires")
     if expires:
         try:
@@ -376,20 +430,30 @@ def _explicit_freshness_seconds(headers, now: datetime) -> int | None:
     return None
 
 
-def retry_after_seconds(headers, now: datetime | None = None) -> int:
+def retry_after_seconds(headers, now: datetime | None = None,
+                        elapsed_seconds: int = 0) -> int:
+    """Return a Retry-After deadline as seconds from ``now``.
+
+    Delta-seconds are relative to the response that carried them, so callers
+    parsing a response received after an in-call wait must include that elapsed
+    time.  HTTP dates are already absolute and must not be shifted again.
+    """
     value = _header(headers, "Retry-After")
     if not value:
         return 0
+    seconds = _delta_seconds(value)
+    if seconds is not None:
+        elapsed = max(0, int(elapsed_seconds))
+        return min(MAX_HTTP_DELTA_SECONDS, elapsed + seconds)
     try:
-        return max(0, int(value))
-    except ValueError:
-        try:
-            parsed = parsedate_to_datetime(value)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return max(0, int((parsed - normalize_now(now)).total_seconds()))
-        except (TypeError, ValueError, OverflowError):
-            return 0
+        parsed = parsedate_to_datetime(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        delta = max(0, int(
+            (parsed - normalize_now(now)).total_seconds()))
+        return min(MAX_HTTP_DELTA_SECONDS, delta)
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _schedule_interval_seconds(policy: dict, unchanged_streak: int) -> int:
@@ -404,8 +468,15 @@ def _schedule_interval_seconds(policy: dict, unchanged_streak: int) -> int:
 
 def _fresh_until(headers, now: datetime) -> str | None:
     seconds = _explicit_freshness_seconds(headers, now)
-    return ((now + timedelta(seconds=seconds)).isoformat()
+    return (_deadline_after(now, seconds).isoformat()
             if seconds is not None else None)
+
+
+def _deadline_after(now: datetime, seconds: int) -> datetime:
+    try:
+        return now + timedelta(seconds=seconds)
+    except OverflowError:
+        return datetime.max.replace(tzinfo=timezone.utc)
 
 
 def usable_permanent_redirect(entry: dict, *, now: datetime | None = None) -> str | None:
@@ -420,6 +491,17 @@ def usable_permanent_redirect(entry: dict, *, now: datetime | None = None) -> st
     if until is None or until <= normalize_now(now):
         return None
     return target
+
+
+def usable_gone_tombstone(entry: dict, *, now: datetime | None = None) -> bool:
+    """Return whether an HTTP 410 tombstone is still eligible for reuse."""
+    if entry.get("terminal_status") != 410:
+        return False
+    raw_until = entry.get("terminal_until")
+    if raw_until is None:
+        return True
+    until = _parse_time(raw_until)
+    return until is not None and until > normalize_now(now)
 
 
 def _requires_revalidation(entry: dict) -> bool:
@@ -450,7 +532,7 @@ def _record_host_cooldown(root: Path, url: str, now: datetime,
         return
     key = host_state_key(url)
     old = load_entry(root, key)
-    blocked_until = now + timedelta(seconds=retry_after)
+    blocked_until = _deadline_after(now, retry_after)
     previous = _parse_time(old.get("blocked_until"))
     if previous and previous > blocked_until:
         blocked_until = previous
@@ -506,6 +588,12 @@ def prune_cache(root: Path, *, now: datetime | None = None,
                 entry = json.loads(path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 entry = None
+            if (isinstance(entry, dict)
+                    and usable_gone_tombstone(entry, now=now)):
+                # A 410 tombstone has no body and is intentionally retained until
+                # its freshness expires, an operator successfully rechecks it,
+                # or private state is cleared.
+                continue
             checked = _parse_time((entry or {}).get("last_checked_at"))
             if entry is None or checked is None or checked < cutoff:
                 path.unlink(missing_ok=True)
@@ -585,7 +673,7 @@ def _permanent_redirect_deadline(response, now: datetime) -> tuple[bool, str | N
         if not valid_freshness:
             return False, None
         if seconds is not None:
-            deadlines.append(now + timedelta(seconds=seconds))
+            deadlines.append(_deadline_after(now, seconds))
 
     if not deadlines:
         return True, None
@@ -595,18 +683,9 @@ def _permanent_redirect_deadline(response, now: datetime) -> tuple[bool, str | N
 
 def _redirect_freshness_seconds(headers, now: datetime) -> tuple[bool, int | None]:
     """Parse redirect freshness fail-closed and account for apparent age."""
-    cache_control_tokens = [
-        token.strip().partition("=")[0].strip().lower()
-        for token in _header(headers, "Cache-Control").split(",")
-        if token.strip()
-    ]
-    if cache_control_tokens.count("max-age") > 1:
-        return False, None
-    directives = _cache_control(headers)
-    if "max-age" in directives:
-        try:
-            lifetime = max(0, int(directives["max-age"]))
-        except (TypeError, ValueError):
+    max_age_present, valid_max_age, lifetime = _max_age_seconds(headers)
+    if max_age_present:
+        if not valid_max_age or lifetime is None:
             return False, None
         valid_age, age, _ = _redirect_current_age(headers, now)
         if not valid_age:
@@ -633,9 +712,9 @@ def _redirect_freshness_seconds(headers, now: datetime) -> tuple[bool, int | Non
 def _redirect_current_age(
         headers, now: datetime) -> tuple[bool, int, datetime]:
     """Return RFC-style current age and the response Date baseline."""
-    try:
-        age = max(0, int(_header(headers, "Age") or 0))
-    except (TypeError, ValueError):
+    raw_age = _header(headers, "Age") or "0"
+    age = _delta_seconds(raw_age)
+    if age is None:
         return False, 0, now
     served_at = now
     date_value = _header(headers, "Date")
@@ -650,6 +729,36 @@ def _redirect_current_age(
         apparent_age = max(0, int((now - served_at).total_seconds()))
         age = max(age, apparent_age)
     return True, age, served_at
+
+
+def _gone_tombstone_deadline(response, now: datetime) -> tuple[bool, str | None]:
+    """Return whether a 410 decision is reusable and its earliest expiry."""
+    if response is None:
+        return False, None
+    deadlines = []
+    observed = [*(getattr(response, "history", None) or []), response]
+    for item in observed:
+        headers = getattr(item, "headers", None)
+        directives = _cache_control(headers)
+        if any(name in directives for name in (
+                "no-store", "no-cache", "must-revalidate",
+                "proxy-revalidate")):
+            return False, None
+        vary = {
+            token.strip().lower()
+            for token in _header(headers, "Vary").split(",") if token.strip()
+        }
+        if "*" in vary:
+            return False, None
+        valid_freshness, seconds = _redirect_freshness_seconds(headers, now)
+        if not valid_freshness:
+            return False, None
+        if seconds is not None:
+            deadlines.append(_deadline_after(now, seconds))
+    if not deadlines:
+        return True, None
+    deadline = min(deadlines)
+    return deadline > now, deadline.isoformat()
 
 
 def _apply_permanent_redirect(entry: dict, response, *, now: datetime,
@@ -711,6 +820,9 @@ def store_success(root: Path, prepared: PreparedRequest, response,
             "retry_at": None,
             "allow_stale": False,
         })
+        entry.pop("terminal_status", None)
+        entry.pop("terminal_until", None)
+        entry.pop("gone_at", None)
         _apply_permanent_redirect(
             entry, response, now=now, enabled=policy["enabled"])
         _write_entry(root, prepared.key, entry)
@@ -770,6 +882,40 @@ def store_success(root: Path, prepared: PreparedRequest, response,
     return response
 
 
+def record_gone(root: Path, prepared: PreparedRequest, *,
+                source: dict | None = None, now: datetime | None = None,
+                logical_day: str | None = None, error: str = "",
+                response=None) -> bool:
+    """Persist an HTTP 410 tombstone without retaining stale bytes or validators."""
+    now = normalize_now(now)
+    logical_day = logical_day or now.date().isoformat()
+    if not resolve_policy(source)["enabled"]:
+        return False
+    reusable, deadline = _gone_tombstone_deadline(response, now)
+    if not reusable:
+        return False
+    old = prepared.entry
+    entry = {
+        "version": 1,
+        "url": prepared.url,
+        "accept": prepared.accept,
+        "cacheable": False,
+        "last_checked_at": now.isoformat(),
+        "logical_day": logical_day,
+        "terminal_status": 410,
+        "terminal_until": deadline,
+        "gone_at": str(old.get("gone_at") or now.isoformat()),
+        "failure_streak": int(old.get("failure_streak") or 0) + 1,
+        "retry_at": None,
+        "allow_stale": False,
+        "last_error": error[:500],
+    }
+    _write_entry(root, prepared.key, entry)
+    prepared.entry = entry
+    prepared.cached_response = None
+    return True
+
+
 def record_failure(root: Path, prepared: PreparedRequest, *,
                    source: dict | None = None, now: datetime | None = None,
                    logical_day: str | None = None, retry_after: int = 0,
@@ -787,7 +933,7 @@ def record_failure(root: Path, prepared: PreparedRequest, *,
         backoff = min(policy["failure_max_minutes"] * 60, backoff)
         # Retry-After is the origin's lower bound, not a hint our local cap may shorten.
         backoff = max(backoff, retry_after)
-        retry_at = (now + timedelta(seconds=backoff)).isoformat()
+        retry_at = _deadline_after(now, backoff).isoformat()
     else:
         retry_at = None
     entry = dict(old)

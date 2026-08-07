@@ -11,7 +11,8 @@ audit:
   max_subreddits_per_run: 1
   max_requests_per_day: 1
   request_delay_seconds: 1800
-  keep_days: 240
+  # 60 个社区每天轮换 1 个、每个累计 14 次需要 840 天；留足完整窗口和缓冲。
+  keep_days: 900
   signal_match_window_days: 30
 
   # 这些域名只作为“直接证据链接”代理，不等同于已经核验过的原创来源。

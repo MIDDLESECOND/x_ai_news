@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from html import unescape
 from pathlib import Path
@@ -27,13 +28,15 @@ from urllib.parse import urljoin, urlsplit
 import requests
 import yaml
 
-from http_fetch_state import (FetchCooldown, discard_cached_response,
+from http_fetch_state import (FetchCooldown, FetchGone, discard_cached_response,
                               host_cooldown, host_lease_key, prepare_request,
-                              prune_cache, record_failure, record_host_cooldown,
-                              request_lease, resolve_policy,
+                              prune_cache, record_failure, record_gone,
+                              record_host_cooldown, request_lease, resolve_policy,
                               retry_after_seconds, store_success,
-                              usable_permanent_redirect)
+                              usable_gone_tombstone, usable_permanent_redirect)
 from reddit_rate_limit import is_reddit_url, reserve_request
+from reddit_audit_baseline import refresh_l1_baseline
+from state_io import atomic_write_if_changed, semantic_hash
 
 ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = ROOT / "data" / "state"
@@ -45,6 +48,9 @@ HTTP_LOGICAL_DAY = None
 _HTTP_EVENTS = []
 _monotonic = time.monotonic
 _download_timer = threading.Timer
+_REDIRECT_DNS_PIN_LOCK = threading.Lock()
+_DIRECT_PROXIES = {"http": None, "https": None, "all": None}
+FORMAL_REDDIT_SOURCES_PER_DAY = 1
 
 X_LINK_RE = re.compile(r"https?://(?:x|twitter)\.com/([A-Za-z0-9_]{1,15})/status/(\d+)")
 HTTP_URL_RE = re.compile(r"https?://[^\s<>'\"&]+", re.IGNORECASE)
@@ -77,14 +83,37 @@ def summarize_http_events(events):
         and event.get("cache_status") != "error")
     errors = counts.get("error", 0)
     deferred = counts.get("deferred", 0)
+    terminal_statuses = sorted({
+        int(event["terminal_status"])
+        for event in events if event.get("terminal_status") is not None
+    })
+    gone = 410 in terminal_statuses
+    nonterminal_errors = sum(
+        1 for event in events
+        if event.get("cache_status") == "error"
+        and event.get("terminal_status") is None)
+    nonterminal_deferred = sum(
+        1 for event in events
+        if event.get("cache_status") == "deferred"
+        and event.get("terminal_status") is None)
+    nonterminal_unknown = sum(
+        1 for event in events
+        if event.get("cache_status") in {None, "", "unknown"}
+        and event.get("terminal_status") is None)
     usable_responses = sum(
         count for status, count in counts.items()
         if status not in {"error", "deferred", "unknown"})
     successes = sorted(
         str(event["last_network_success_at"])
         for event in events if event.get("last_network_success_at"))
-    if (errors or deferred) and usable_responses:
+    if (errors or deferred or gone) and usable_responses:
         source_status = "partial"
+    elif nonterminal_errors or nonterminal_unknown:
+        source_status = "error"
+    elif nonterminal_deferred:
+        source_status = "deferred"
+    elif gone:
+        source_status = "gone"
     elif errors:
         source_status = "error"
     elif network_successes:
@@ -104,6 +133,7 @@ def summarize_http_events(events):
         "network_errors": errors,
         "usable_responses": usable_responses,
         "cache_statuses": counts,
+        "terminal_statuses": terminal_statuses,
         "last_network_success_at": successes[-1] if successes else None,
     }
 
@@ -121,7 +151,7 @@ class ResponseDownloadTimeout(requests.Timeout):
 
 
 class UnsafeRedirectTarget(requests.RequestException):
-    """An untrusted redirect resolved outside the public Internet boundary."""
+    """A redirect left configured trust or the public Internet boundary."""
 
 
 def close_response(response):
@@ -132,7 +162,41 @@ def close_response(response):
         pass
 
 
-def validate_public_redirect_target(url):
+def _redirect_host_patterns(configured_url, source=None):
+    configured_host = (urlsplit(configured_url).hostname or "").lower().rstrip(".")
+    patterns = [configured_host] if configured_host else []
+    configured = (source or {}).get("allowed_redirect_hosts") or []
+    if isinstance(configured, str):
+        configured = [configured]
+    for value in configured:
+        pattern = str(value or "").strip().lower().rstrip(".")
+        if "://" in pattern:
+            pattern = (urlsplit(pattern).hostname or "").lower().rstrip(".")
+        if pattern and pattern not in patterns:
+            patterns.append(pattern)
+    return patterns
+
+
+def validate_trusted_redirect_target(configured_url, target_url, source=None):
+    """Reject redirect-controlled hosts unless configuration already trusts them."""
+    try:
+        host = (urlsplit(target_url).hostname or "").lower().rstrip(".")
+    except ValueError as error:
+        raise UnsafeRedirectTarget(f"无效重定向目标：{target_url}") from error
+    patterns = _redirect_host_patterns(configured_url, source)
+    trusted = any(
+        host == pattern
+        or (pattern.startswith("*.") and host.endswith(pattern[1:])
+            and host != pattern[2:])
+        for pattern in patterns
+    )
+    if not host or not trusted:
+        raise UnsafeRedirectTarget(
+            f"重定向目标主机未在信源配置中授权：{host or '(empty)'}")
+    return target_url
+
+
+def validate_public_redirect_target(url, *, return_addresses=False):
     """Fail closed unless every resolved redirect address is globally routable."""
     try:
         parts = urlsplit(url)
@@ -182,7 +246,49 @@ def validate_public_redirect_target(url):
     if unsafe:
         raise UnsafeRedirectTarget(
             f"重定向目标包含非公网地址：{', '.join(unsafe)}")
+    if return_addresses:
+        return host, expected_port, tuple(sorted(str(value) for value in resolved))
     return url
+
+
+@contextmanager
+def pin_redirect_dns(host, port, addresses):
+    """Pin the actual Requests connection to the just-validated DNS answers."""
+    host = str(host).lower().rstrip(".")
+    addresses = tuple(addresses)
+    with _REDIRECT_DNS_PIN_LOCK:
+        previous = socket.getaddrinfo
+
+        def pinned_getaddrinfo(query_host, query_port, family=0, type=0,
+                               proto=0, flags=0):
+            query = str(query_host or "").lower().rstrip(".")
+            if query != host:
+                return previous(
+                    query_host, query_port, family, type, proto, flags)
+            records = []
+            for value in addresses:
+                address = ipaddress.ip_address(value)
+                address_family = (
+                    socket.AF_INET6 if address.version == 6 else socket.AF_INET)
+                if family not in (0, socket.AF_UNSPEC, address_family):
+                    continue
+                socket_type = type or socket.SOCK_STREAM
+                protocol = proto or (
+                    socket.IPPROTO_TCP if socket_type == socket.SOCK_STREAM else 0)
+                sockaddr = ((str(address), port, 0, 0)
+                            if address.version == 6 else (str(address), port))
+                records.append(
+                    (address_family, socket_type, protocol, "", sockaddr))
+            if not records:
+                raise socket.gaierror(
+                    socket.EAI_NONAME, "validated redirect address unavailable")
+            return records
+
+        socket.getaddrinfo = pinned_getaddrinfo
+        try:
+            yield
+        finally:
+            socket.getaddrinfo = previous
 
 
 def validate_http_response(response, response_kind):
@@ -283,7 +389,8 @@ def materialize_response_body(response, max_bytes, max_seconds=None):
 
 
 def http_get(url, accept=None, *, source=None, cache_root=None, now=None,
-             logical_day=None, force_revalidate=None, response_kind=None):
+             logical_day=None, force_revalidate=None, response_kind=None,
+             trusted_parent_url=None):
     """GET with persistent validators, bounded freshness reuse, and hard Reddit gate.
 
     Cached responses are normal ``requests.Response`` objects, so fetchers keep
@@ -321,14 +428,17 @@ def http_get(url, accept=None, *, source=None, cache_root=None, now=None,
                 return ready
             return _network_http_get(
                 url, accept, source, cache_root, now, logical_day, prepared,
-                key_lease, response_kind)
+                key_lease, response_kind, trusted_parent_url)
     except FetchCooldown as error:
         if not (_HTTP_EVENTS and _HTTP_EVENTS[-1].get("url") == url
                 and _HTTP_EVENTS[-1].get("cache_status") == "deferred"):
-            _HTTP_EVENTS.append({
+            event = {
                 "url": url, "cache_status": "deferred", "network_attempts": 0,
                 "error": type(error).__name__,
-            })
+            }
+            if prepared.terminal_status == 410:
+                event["terminal_status"] = 410
+            _HTTP_EVENTS.append(event)
         raise
 
 
@@ -352,11 +462,23 @@ def _prepared_response(url, prepared, cache_root, now, logical_day, response_kin
                 prepared.cached_response, "frontier_last_network_success_at", None),
         })
         return prepared.cached_response
-    if prepared.deferred_until:
+    if prepared.terminal_blocked:
         _HTTP_EVENTS.append({
             "url": url, "cache_status": "deferred", "network_attempts": 0,
-            "retry_at": prepared.deferred_until,
+            "terminal_status": 410,
         })
+        raise FetchGone(
+            "源站已返回 HTTP 410 Gone，自动轮询已停止；"
+            "可用 --refresh-http 人工复核"
+            + (f"：{prepared.deferred_error}" if prepared.deferred_error else ""))
+    if prepared.deferred_until:
+        event = {
+            "url": url, "cache_status": "deferred", "network_attempts": 0,
+            "retry_at": prepared.deferred_until,
+        }
+        if prepared.terminal_status == 410:
+            event["terminal_status"] = 410
+        _HTTP_EVENTS.append(event)
         raise FetchCooldown(
             f"请求仍在失败冷却期（至 {prepared.deferred_until}）"
             + (f"：{prepared.deferred_error}" if prepared.deferred_error else ""))
@@ -376,7 +498,7 @@ def _sleep_with_lease_heartbeat(seconds, *leases):
 
 
 def _network_http_get(url, accept, source, cache_root, now, logical_day, prepared,
-                      key_lease, response_kind):
+                      key_lease, response_kind, trusted_parent_url=None):
     headers = {"User-Agent": UA}
     if accept:
         headers["Accept"] = accept
@@ -389,6 +511,7 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
     policy = resolve_policy(source)
     max_download_bytes = policy["max_download_bytes"]
     max_download_seconds = policy["max_download_seconds"]
+    had_gone_tombstone = usable_gone_tombstone(prepared.entry, now=now)
     remembered_redirect = (
         usable_permanent_redirect(prepared.entry, now=now)
         if policy["enabled"] else None)
@@ -401,6 +524,7 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
             or remembered_redirect == url):
         remembered_redirect = None
     request_start_url = remembered_redirect or url
+    trust_anchor_url = trusted_parent_url or url
     if had_redirect_memory and remembered_redirect is None:
         # Validators belong to the remembered target representation, not the
         # configured origin whose redirect mapping now needs revalidation.
@@ -417,6 +541,8 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
     def request_hop(request_url, request_headers, *, untrusted_redirect=False):
         nonlocal attempts, retry_after_observed, retry_after_waited, retried_429
         if untrusted_redirect:
+            validate_trusted_redirect_target(
+                trust_anchor_url, request_url, source)
             validate_public_redirect_target(request_url)
         with request_lease(cache_root, host_lease_key(request_url)) as host_lease:
             blocked_until, blocked_error = host_cooldown(
@@ -434,8 +560,18 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
                 if untrusted_redirect:
                     # Resolve immediately before each real attempt, including a
                     # retry after a long rate-limit wait.
-                    validate_public_redirect_target(request_url)
+                    pinned = validate_public_redirect_target(
+                        request_url, return_addresses=True)
+                else:
+                    pinned = None
                 attempts += 1
+                if pinned is not None:
+                    host, port, addresses = pinned
+                    with pin_redirect_dns(host, port, addresses):
+                        return requests.get(
+                            request_url, headers=request_headers, timeout=TIMEOUT,
+                            allow_redirects=False, stream=True,
+                            proxies=dict(_DIRECT_PROXIES))
                 return requests.get(
                     request_url, headers=request_headers, timeout=TIMEOUT,
                     allow_redirects=False, stream=True)
@@ -456,15 +592,19 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
                     retry_after_waited += wait
                     response = gated_request()
                     if response.status_code == 429:
+                        second_retry_after = retry_after_seconds(
+                            response.headers, now,
+                            elapsed_seconds=retry_after_waited)
                         retry_after_observed = max(
                             retry_after_observed,
-                            retry_after_waited
-                            + (retry_after_seconds(response.headers, now) or 30))
+                            second_retry_after
+                            or retry_after_waited + 30)
             if response.status_code in {429, 503}:
                 final_retry_after = max(
                     retry_after_observed,
-                    retry_after_waited
-                    + retry_after_seconds(response.headers, now))
+                    retry_after_seconds(
+                        response.headers, now,
+                        elapsed_seconds=retry_after_waited))
                 if final_retry_after:
                     record_host_cooldown(
                         cache_root, request_url,
@@ -519,7 +659,9 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
     try:
         resp = request_chain(
             request_start_url, headers,
-            untrusted_start=remembered_redirect is not None)
+            untrusted_start=(
+                remembered_redirect is not None
+                or trusted_parent_url is not None))
         # 元数据尚在但不可变 body 被清理时，304 无法还原响应；只在这种损坏场景无条件补取一次。
         if resp.status_code == 304:
             not_modified = resp
@@ -532,7 +674,9 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
                 headers.pop("If-Modified-Since", None)
                 resp = request_chain(
                     request_start_url, headers,
-                    untrusted_start=remembered_redirect is not None)
+                    untrusted_start=(
+                        remembered_redirect is not None
+                        or trusted_parent_url is not None))
             else:
                 resp = restored
         if getattr(resp, "frontier_cache_status", "") != "revalidated":
@@ -542,9 +686,10 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
             try:
                 validate_http_response(resp, response_kind)
             except ResponseValidationError as error:
-                discard_cached_response(
-                    cache_root, prepared, now=now, logical_day=logical_day,
-                    error=f"{type(error).__name__}: {error}")
+                if not had_gone_tombstone:
+                    discard_cached_response(
+                        cache_root, prepared, now=now, logical_day=logical_day,
+                        error=f"{type(error).__name__}: {error}")
                 raise
             resp = store_success(
                 cache_root, prepared, resp, source=source, now=now,
@@ -557,19 +702,23 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
             except ResponseTooLarge as error:
                 # A 304 proves the oversized cached representation is unchanged;
                 # an unconditional second download would only waste bandwidth.
-                discard_cached_response(
-                    cache_root, prepared, now=now, logical_day=logical_day,
-                    error=f"{type(error).__name__}: {error}")
+                if not had_gone_tombstone:
+                    discard_cached_response(
+                        cache_root, prepared, now=now, logical_day=logical_day,
+                        error=f"{type(error).__name__}: {error}")
                 raise
             except ResponseValidationError as error:
-                discard_cached_response(
-                    cache_root, prepared, now=now, logical_day=logical_day,
-                    error=f"{type(error).__name__}: {error}")
+                if not had_gone_tombstone:
+                    discard_cached_response(
+                        cache_root, prepared, now=now, logical_day=logical_day,
+                        error=f"{type(error).__name__}: {error}")
                 headers.pop("If-None-Match", None)
                 headers.pop("If-Modified-Since", None)
                 resp = request_chain(
                     request_start_url, headers,
-                    untrusted_start=remembered_redirect is not None)
+                    untrusted_start=(
+                        remembered_redirect is not None
+                        or trusted_parent_url is not None))
                 resp.raise_for_status()
                 materialize_response_body(
                     resp, max_download_bytes, max_download_seconds)
@@ -596,13 +745,20 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
             requests.ConnectionError, requests.Timeout,
             requests.exceptions.ChunkedEncodingError,
             requests.exceptions.ContentDecodingError))
+        tombstone_gone = (status_code == 410
+                          and remembered_redirect is None and all(
+            hop.status_code in {301, 308}
+            for hop in (getattr(resp, "history", None) or [])))
+        remembered_target_gone = (
+            status_code == 410 and remembered_redirect is not None)
         if remembered_redirect is not None:
             # Any real failure at a remembered target makes the optimization
             # self-heal: after the normal cooldown, retry the configured URL.
             prepared.entry = dict(prepared.entry)
             prepared.entry.pop("permanent_redirect_url", None)
             prepared.entry.pop("permanent_redirect_until", None)
-        if oversized or unsafe_redirect:
+        if ((oversized or unsafe_redirect or remembered_target_gone)
+                and not had_gone_tombstone):
             discard_cached_response(
                 cache_root, prepared, now=now, logical_day=logical_day,
                 error=f"{type(error).__name__}: {error}")
@@ -614,18 +770,35 @@ def _network_http_get(url, accept, source, cache_root, now, logical_day, prepare
             or status_code in {500, 502, 503, 504}))
         retry_after = max(
             retry_after_observed,
-            (retry_after_waited
-             + retry_after_seconds(getattr(resp, "headers", {}), now))
+            retry_after_seconds(
+                getattr(resp, "headers", {}), now,
+                elapsed_seconds=retry_after_waited)
             if resp is not None else 0)
-        record_failure(
-            cache_root, prepared, source=source, now=now,
-            logical_day=logical_day, retry_after=retry_after,
-            retryable=retryable, allow_stale=allow_stale,
-            error=f"{type(error).__name__}: {error}",
-            host_url=getattr(resp, "url", None) or url)
+        stored_gone = False
+        if tombstone_gone:
+            stored_gone = record_gone(
+                cache_root, prepared, source=source, now=now,
+                logical_day=logical_day,
+                error=f"{type(error).__name__}: {error}", response=resp)
+        if not stored_gone:
+            if tombstone_gone and policy["enabled"]:
+                # Cache directives can forbid a durable tombstone, but a 410
+                # still invalidates any older body and validators immediately.
+                discard_cached_response(
+                    cache_root, prepared, now=now, logical_day=logical_day,
+                    error=f"{type(error).__name__}: {error}")
+            record_failure(
+                cache_root, prepared, source=source, now=now,
+                logical_day=logical_day, retry_after=retry_after,
+                retryable=retryable, allow_stale=allow_stale,
+                error=f"{type(error).__name__}: {error}",
+                host_url=getattr(resp, "url", None) or url)
         _HTTP_EVENTS.append({
             "url": url, "cache_status": "error",
             "network_attempts": attempts, "error": type(error).__name__,
+            **({"terminal_status": 410}
+               if stored_gone or (had_gone_tombstone and not tombstone_gone)
+               else {}),
         })
         if resp is not None:
             close_response(resp)
@@ -735,7 +908,9 @@ def fetch_rss(src):
             if it.get("x_links") or not it.get("url"):
                 continue
             try:
-                it["x_links"] = mine_x_links(http_get(it["url"], source=src).text)
+                it["x_links"] = mine_x_links(http_get(
+                    it["url"], source=src,
+                    trusted_parent_url=src["url"]).text)
             except Exception:
                 pass  # 单页失败不影响信源整体
     return items
@@ -1308,6 +1483,27 @@ def prune_raw(keep_days, today):
     return removed
 
 
+def select_daily_reddit_sources(sources, logical_day, *, limit=None):
+    """Choose a deterministic rotating formal batch under the shared hard gate."""
+    candidates = [
+        str(source["id"])
+        for source in sources
+        if source.get("enabled", True)
+        and source.get("id")
+        and is_reddit_url(str(source.get("url") or ""))
+    ]
+    if not candidates:
+        return set()
+    batch_size = min(
+        len(candidates), FORMAL_REDDIT_SOURCES_PER_DAY
+        if limit is None else max(0, int(limit)))
+    start = date.fromisoformat(logical_day).toordinal() % len(candidates)
+    return {
+        candidates[(start + offset) % len(candidates)]
+        for offset in range(batch_size)
+    }
+
+
 def main():
     global HTTP_FORCE_REVALIDATE, HTTP_LOGICAL_DAY
     ap = argparse.ArgumentParser()
@@ -1316,7 +1512,8 @@ def main():
     ap.add_argument("--only", default="", help="只抓这些信源（逗号分隔的 id，测试用）")
     ap.add_argument(
         "--refresh-http", action="store_true",
-        help="忽略本地新鲜期并立即向源站复核；仍发送条件头，且不能绕过 Reddit 硬闸门")
+        help="忽略本地新鲜期和 410 tombstone 并立即向源站复核；"
+             "仍发送条件头，且不能绕过 Reddit 硬闸门")
     args = ap.parse_args()
     HTTP_FORCE_REVALIDATE = args.refresh_http
     HTTP_LOGICAL_DAY = args.date
@@ -1325,6 +1522,9 @@ def main():
     cfg = yaml.safe_load((ROOT / "config" / "sources.yaml").read_text(encoding="utf-8"))
     topics_path = ROOT / "config" / "topics.yaml"
     topics_cfg = yaml.safe_load(topics_path.read_text(encoding="utf-8")) if topics_path.exists() else {}
+    # The designated formal source is derived from the full configuration so
+    # repeated --only invocations cannot each nominate a different Reddit URL.
+    selected_reddit = select_daily_reddit_sources(cfg["sources"], args.date)
 
     out_dir = ROOT / "data" / "raw" / args.date
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1336,6 +1536,11 @@ def main():
             continue
         if not src.get("enabled", True):
             log["sources"][src["id"]] = {"status": "skipped"}
+            continue
+        if (is_reddit_url(str(src.get("url") or ""))
+                and src["id"] not in selected_reddit):
+            log["sources"][src["id"]] = {
+                "status": "skipped", "reason": "reddit_daily_rotation"}
             continue
         # 检索词/追踪清单从 topics.yaml 派生，模型清单只维护一处
         if src.get("queries_from") == "model_keywords":
@@ -1367,19 +1572,22 @@ def main():
                 },
                 "items": items,
             }
-            (out_dir / f"{src['id']}.json").write_text(
-                json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+            snapshot = json.dumps(payload, ensure_ascii=False, indent=1)
+            snapshot_path = out_dir / f"{src['id']}.json"
+            snapshot_path.write_text(
+                snapshot, encoding="utf-8")
             source_status = http_summary["source_status"]
             log["sources"][src["id"]] = {
                 "status": source_status, "items": len(items),
                 "http": payload["retrieval"],
+                "snapshot_hash": semantic_hash(snapshot_path.read_bytes()),
             }
             label = {
                 "cached": "cache", "stale": "stale", "deferred": "defer",
-                "partial": "part", "error": "fail",
+                "gone": "gone", "partial": "part", "error": "fail",
             }.get(source_status, "ok")
             print(f"[{label:<5}] {src['id']}: {len(items)} items")
-            if source_status == "error":
+            if source_status in {"error", "gone"}:
                 failed += 1
             elif source_status == "partial":
                 partial += 1
@@ -1387,16 +1595,59 @@ def main():
                 ok += 1
         except Exception as e:
             events = take_http_events()
-            log["sources"][src["id"]] = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+            http_summary = summarize_http_events(events) if events else None
+            source_status = (
+                "gone" if http_summary
+                and http_summary["source_status"] == "gone" else "error")
+            log["sources"][src["id"]] = {
+                "status": source_status, "error": f"{type(e).__name__}: {e}"}
             if events:
-                log["sources"][src["id"]]["http"] = summarize_http_events(events)
-            print(f"[fail] {src['id']}: {type(e).__name__}: {e}")
+                log["sources"][src["id"]]["http"] = http_summary
+            label = "gone" if source_status == "gone" else "fail"
+            print(f"[{label}] {src['id']}: {type(e).__name__}: {e}")
             failed += 1
 
-    if not only:  # --only 是局部测试，不覆盖全量日志、不触发保留清理
-        (out_dir / "_fetch_log.json").write_text(
-            json.dumps(log, ensure_ascii=False, indent=1), encoding="utf-8")
-        pruned = prune_raw(args.keep_days, args.date)
+    if not only:
+        log["run_mode"] = "full"
+        log["completed_at"] = datetime.now(timezone.utc).isoformat()
+        atomic_write_if_changed(
+            out_dir / "_fetch_log.json",
+            json.dumps(log, ensure_ascii=False, indent=1))
+        baseline_ok = False
+        try:
+            reddit_audit_path = ROOT / "config" / "reddit_audit.yaml"
+            reddit_audit_cfg = (
+                yaml.safe_load(reddit_audit_path.read_text(encoding="utf-8")) or {}
+                if reddit_audit_path.exists() else {})
+            audit_keep_days = int(
+                reddit_audit_cfg.get("audit", {}).get("keep_days", 900))
+            signal_window_days = int(
+                reddit_audit_cfg.get("audit", {}).get(
+                    "signal_match_window_days", 30))
+            audit_duration_days = int(
+                reddit_audit_cfg.get("audit", {}).get("duration_days", 14))
+            non_reddit_source_ids = {
+                source["id"] for source in cfg["sources"]
+                if source.get("id")
+                and not is_reddit_url(str(source.get("url") or ""))
+            }
+            refresh_l1_baseline(
+                ROOT / "data" / "raw",
+                ROOT / "data" / "reddit_audit" / "l1_baseline",
+                args.date, non_reddit_source_ids, audit_keep_days,
+                signal_window_days, audit_duration_days)
+            log["reddit_audit_baseline"] = {"status": "ok"}
+            baseline_ok = True
+        except Exception as error:
+            log["reddit_audit_baseline"] = {
+                "status": "error", "error": f"{type(error).__name__}: {error}"}
+            print(f"[warn] Reddit 审计紧凑对照索引刷新失败：{error}")
+        atomic_write_if_changed(
+            out_dir / "_fetch_log.json",
+            json.dumps(log, ensure_ascii=False, indent=1))
+        pruned = prune_raw(args.keep_days, args.date) if baseline_ok else []
+        if not baseline_ok:
+            print("[warn] 为等待紧凑对照索引回填，本轮跳过 data/raw 清理")
         if pruned:
             print(f"已清理 {len(pruned)} 个过期 raw 目录：{', '.join(pruned)}")
         cache_pruned = prune_cache(HTTP_CACHE_ROOT, max_age_days=args.keep_days)
@@ -1404,6 +1655,10 @@ def main():
             print("已清理 HTTP 缓存："
                   f"{cache_pruned['removed_entries']} 个过期索引、"
                   f"{cache_pruned['removed_bodies']} 个孤儿正文")
+    else:  # 局部测试不覆盖全量日志，也不触发保留清理。
+        atomic_write_if_changed(
+            out_dir / "_fetch_log.only.json",
+            json.dumps(log, ensure_ascii=False, indent=1))
     print(f"\n{ok} ok, {partial} partial, {failed} failed -> {out_dir}")
     return 0 if ok + partial > 0 else 1
 

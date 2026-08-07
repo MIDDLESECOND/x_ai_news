@@ -12,7 +12,7 @@
 python scripts/fetch_l1.py && python scripts/build_digest.py
 ```
 
-产出 `briefs/YYYY-MM-DD.md`，七个栏目：今日发布／一线实测／定价与额度变动／降智观察／公司动态／悬案更新／新信源候选。全部信源为免登录公开端点（35 个已启用：AINews、HN Algolia、Reddit RSS、Hugging Face API、厂商官网与定价页、服务状态页 JSON、OpenRouter 与 genai-prices 结构化牌价索引、Yahoo 行情、CodexRadar 降智雷达（IQ 序列追踪；其数据仅私有研究引用）、Aider 排行榜、llama.cpp Releases 等），配置在 [config/sources.yaml](config/sources.yaml)，单信源失败不影响整体。结构化牌价索引只用于发现变化，正式判断仍回到厂商原始定价页。
+产出 `briefs/YYYY-MM-DD.md`，七个栏目：今日发布／一线实测／定价与额度变动／降智观察／公司动态／悬案更新／新信源候选。全部信源为免登录公开端点（36 个已启用：AINews、HN Algolia、Reddit RSS、Hugging Face API、厂商官网与定价页、服务状态页 JSON、OpenRouter 与 genai-prices 结构化牌价索引、Yahoo 行情、CodexRadar 降智雷达（IQ 序列追踪；其数据仅私有研究引用）、Aider 排行榜、llama.cpp Releases 等），配置在 [config/sources.yaml](config/sources.yaml)，单信源失败不影响整体。结构化牌价索引只用于发现变化，正式判断仍回到厂商原始定价页。
 
 日报合成不会把整个历史账本反复送入 LLM。`build_analysis_context.py` 生成一个有大小上限的当前视图：全部未决悬案只保留目录，高精度命中的悬案才展开证据；仅实体词命中的项目单列为人工候选。弱信号进入按月分片的私有候选箱，正式立案与改判保持人工控制。
 
@@ -24,7 +24,7 @@ python scripts/fetch_l1.py && python scripts/build_digest.py
 
 L1 的公开 GET 在私有 `data/state/http_cache/` 保存响应校验器和内容寻址缓存：同一逻辑日的新鲜期内复用原字节，跨日或过期后优先发送 `If-None-Match` / `If-Modified-Since`，收到 304 后继续用已验证正文。HTTP freshness 与应用检查时间分别记账；显式 `max-age`/`Expires` 只会缩短复用窗口，`no-cache`、`must-revalidate`、`no-store` 与 `Vary: *` 均禁止不当复用。默认自适应窗口为 30 分钟至 12 小时，只优化同日重复运行，不跳过次日主抓取。
 
-连续可重试失败采用指数冷却；仅网络错误及 500/502/503/504 可在 12 小时内明确标为 `stale` 复用，其他冷却记为 `deferred`。JSON/XML 正文先通过格式解析才进入可复用缓存，避免把 HTTP 200 的挑战页固化为新鲜响应。网络正文默认最多 15 MB：先检查 `Content-Length`，再以流式读取对实际解压字节执行硬上限；同时每个网络响应的正文读取默认最多 120 秒，由独立 watchdog 到点关闭连接，补足 Requests socket 静默超时不限制整个下载时长的缺口。字节或时间超限均立即关闭且进入失败冷却；前者拒绝旧正文，后者作为传输失败可回退已验证 stale 正文，单信源可用 `fetch_policy.max_download_bytes` / `max_download_seconds` 进一步收紧但不能放宽。多查询信源混合成功与失败记为 `partial`，全部失败记为 `error`。429/503 的 `Retry-After` 同时阻断同一 host 的其他 URL；重定向逐跳关闭自动跟随后处理，每一跳都重新经过 host 冷却与 Reddit 硬闸门。外部重定向只允许 HTTP(S) 默认端口且不得携带用户凭据；每次真实请求前检查全部 A/AAAA 地址，解析失败或任一地址不是公网单播均拒绝、清除旧缓存并进入冷却。只有整条跳转链均为 301/308 且最终正文成功验证后，才把永久目标记入私有 HTTP 状态；任一跳带 `no-store` / `no-cache` / `must-revalidate` / `proxy-revalidate` 或 `Vary: *` 均不记忆，显式 `max-age` / `Expires` 取全链最早截止时间，到期自动回配置地址复核。有效期内直接向目标发送条件请求；302/303/307 不记忆，目标失败后清除记忆并在冷却结束后回到配置地址。这个优化不改写 `config/sources.yaml`，关闭 HTTP 状态缓存时也完全停用。初始 URL 仍由受审的信源配置负责，应用层 DNS 预检也不能替代网络层出站隔离。跨进程同请求与同 host 的联网阶段分别串行，长时间限速等待会刷新带所有者令牌的请求租约。信源健康账本将联网成功、部分成功、缓存复用、失败冷却复用和冷却未请求分开统计。缓存正文按 `--keep-days` 清理，并明确排除在最终产物指纹和私有 Git 备份之外。
+连续可重试失败采用指数冷却；仅网络错误及 500/502/503/504 可在 12 小时内明确标为 `stale` 复用，其他冷却记为 `deferred`。源站直接返回 410 Gone，或全 301/308 永久跳转链末端返回 410 时，会丢弃旧正文与校验器并在私有 HTTP 状态留下 `gone` tombstone；后续自动运行不再联网，人工使用 `--refresh-http` 复核成功后解除。410 与其永久跳转链同样遵守 `no-store` / `no-cache` / `must-revalidate` / `proxy-revalidate`、`Vary: *` 和显式 freshness：禁止复用时不留 tombstone，有 `max-age` / `Expires` 时取全链最早截止并在到期后自动复核。已记忆的永久目标后来返回 410 只会清除映射并回配置地址确认，不直接封锁原地址。上述状态不会自动修改或禁用 `config/sources.yaml`，并在抓取日志和信源健康账本中单列为 `gone`，不与普通冷却混写。JSON/XML 正文先通过格式解析才进入可复用缓存，避免把 HTTP 200 的挑战页固化为新鲜响应。网络正文默认最多 15 MB：先检查 `Content-Length`，再以流式读取对实际解压字节执行硬上限；同时每个网络响应的正文读取默认最多 120 秒，由独立 watchdog 到点关闭连接，补足 Requests socket 静默超时不限制整个下载时长的缺口。字节或时间超限均立即关闭且进入失败冷却；前者拒绝旧正文，后者作为传输失败可回退已验证 stale 正文，单信源可用 `fetch_policy.max_download_bytes` / `max_download_seconds` 进一步收紧但不能放宽。多查询信源混合成功与失败记为 `partial`，全部失败记为 `error`。429/503 的 `Retry-After` 同时阻断同一 host 的其他 URL；重定向逐跳关闭自动跟随后处理，每一跳都重新经过 host 冷却与 Reddit 硬闸门。重定向默认只能留在配置 URL 的同一主机；确需跨主机时，必须由受审信源配置显式列入 `allowed_redirect_hosts`（可使用 `*.example.com` 形式）。这样页面返回的未授权 Location 不能把请求信任边界扩展到攻击者控制的 DNS；获授权主机与初始 URL 一样属于配置侧信任边界。所有跳转目标仍只允许 HTTP(S) 默认端口且不得携带用户凭据，每次真实请求前检查全部 A/AAAA 地址，解析失败或任一地址不是公网单播均拒绝，并把刚确认的公网地址固定到随后的实际连接，关闭 DNS rebinding 时间窗。跳转后的连接不继承环境代理，避免在代理端重新解析目标；需要代理才能访问的目标应改为受审的初始信源 URL，而不是放宽这个边界。RSS 正文缺链时派生出的文章页 URL 也按原信源主机边界处理：未授权主机在联网前拒绝，获授权目标执行同样的公网复核和连接固定。只有整条跳转链均为 301/308 且最终正文成功验证后，才把永久目标记入私有 HTTP 状态；任一跳带 `no-store` / `no-cache` / `must-revalidate` / `proxy-revalidate` 或 `Vary: *` 均不记忆，显式 `max-age` / `Expires` 取全链最早截止时间，到期自动回配置地址复核。有效期内直接向目标发送条件请求；302/303/307 不记忆，目标失败后清除记忆并在冷却结束后回到配置地址。这个优化不改写 `config/sources.yaml`，关闭 HTTP 状态缓存时也完全停用。初始 URL 与显式授权的跨主机目标仍由受审信源配置负责，应用层防护仍应叠加网络层出站隔离。跨进程同请求与同 host 的联网阶段分别串行，长时间限速等待会刷新带所有者令牌的请求租约。信源健康账本将联网成功、部分成功、缓存复用、失败冷却复用、冷却未请求和 Gone 待复核分开统计。缓存正文按 `--keep-days` 清理；仍有效的 410 tombstone 只保留小型元数据，并明确排除在最终产物指纹和私有 Git 备份之外。
 
 ### Reddit 信源影子审计
 
@@ -38,12 +38,24 @@ python scripts/audit_reddit_sources.py
 ```
 
 原始样本写入 `data/reddit_audit/`，日报之外的阶段报告写入
-`reports/reddit-source-audit/`；二者均为私有层。休眠配置每次最多轮换 1 个社区，同一社区当天不重复。
-所有直接 Reddit 请求（正式 L1 与影子审计）共享 `config/reddit_access.yaml` 的硬限制：至少间隔
-30 分钟、UTC 日总预算 2 次，失败与重试也计数；账号安全锁定期间该入口保持关闭，临时改用
-人工触发、只读的浏览器观察。电脑关机造成的自然日空档不丢样本；未满
-14 次只显示临时排名，不会自动修改 `config/sources.yaml`。若当天只需重算报告，可加
-`--report-only`。
+`reports/reddit-source-audit/`；二者均为私有层。正式 L1 每天只轮换 1 个已启用 Reddit 源，
+影子审计每次也最多轮换 1 个社区，同一社区当天不重复；间歇运行时按累计尝试最少、最久未
+尝试的社区优先，不依赖连续日历日期。所有直接 Reddit 请求（正式 L1 与
+影子审计）共享 `config/reddit_access.yaml` 的硬限制：至少间隔 30 分钟、按实际排程所属 UTC
+日总预算 2 次，失败与重试也计数；预算锁由操作系统内核持有，进程退出或崩溃后自动释放，
+常驻锁文件不代表仍有活跃 owner。账号安全锁定期间该入口保持关闭，临时改用人工触发、
+只读的浏览器观察。审计原始记录至少保留完成全池 14 轮所需的窗口，电脑关机造成的自然日
+空档不丢样本；未满 14 次只显示临时排名，不会自动修改 `config/sources.yaml`。若当天只需
+重算报告，可加 `--report-only`。
+
+正式 L1 每天还会在私有 `data/reddit_audit/l1_baseline/` 写一份紧凑对照索引，只保留非
+Reddit 条目的已校验时间、限长标题与去查询参数 URL，不复制摘要正文；每条记录必须由完整
+L1 抓取日志中的快照哈希确认，`--only` 文件和失败后遗留旧文件不能进入。索引名义上沿用
+Reddit 审计保留期，并额外保护当前最老审计样本及其匹配窗口，用于在 45 天完整 raw 被清理后
+继续复算跨长空档样本的既有信源命中与领先时间。首次启用时只能回填机器上尚未清理且带新版
+`run_mode` / `completed_at` / `snapshot_hash` 回执的 raw；旧版日志无法排除 `--only` 污染，
+因此不会自动迁移，已被历史清理的数据也不会凭空恢复。索引刷新失败时本轮保留 raw，待下次回填。
+该紧凑索引不含摘要正文，并随其他记忆核心进入私有备份。
 
 其他日报分区使用同一套影子晋退逻辑，但按栏目采用不同质量指标：发布看官方确认与
 模型卡/权重，实测看方法学与复现材料，定价看可读价格正文，降智看诊断与多源印证，
@@ -60,6 +72,9 @@ python scripts/audit_source_partitions.py
 扩展内容回看窗，并按 `low_frequency` 节奏单独判断，不会因为日更活跃度低而与新闻聚合器
 直接比较。配置为低频轮换的作者不会加入无人值守采样，但可用
 `--only trial_jay_alammar` 这类显式专项调用；历史资料库入口即使显式指定也不会自动抓取。
+影子采集使用独立 HTTP 缓存与域名冷却状态，不会反向阻塞正式 L1；同一日期已有成功快照的
+候选不会重复请求。`--date` 的历史日期只能与 `--report-only` 配合复算既有样本，禁止把
+当前网络内容回填为历史观察。
 
 其中 `expert_author` 轨道首批影子采样 10 个来源：Lilian Weng、Sebastian Raschka、
 Eugene Yan、Hamel Husain、Shreya Shankar、Armin Ronacher、Max Woolf、

@@ -284,7 +284,7 @@ def annotate_candidate_items(source, items):
 
 
 def hydrate_expert_fulltext(source, items):
-    """对 RSS 正文缺失/过短的少量最新条目抓文章页；正文仍只在内存中存在。"""
+    """抓少量同信任边界文章页；派生正文不会进入审计快照。"""
     if source.get("track") != "expert_author":
         return items
     maximum = int(source.get("audit_body_fallback_items") or 0)
@@ -302,7 +302,9 @@ def hydrate_expert_fulltext(source, items):
             time.sleep(delay)
         attempted += 1
         try:
-            response = fetch_l1.http_get(item["url"], accept="text/html,application/xhtml+xml")
+            response = fetch_l1.http_get(
+                item["url"], accept="text/html,application/xhtml+xml",
+                source=source, trusted_parent_url=source["url"])
             if response.encoding in (None, "ISO-8859-1"):
                 response.encoding = response.apparent_encoding or "utf-8"
             text = fetch_l1.visible_html_text(response.text)
@@ -324,7 +326,12 @@ def candidates_for_collection(config, only=None):
             and (source.get("enabled", True) or source.get("audit_group") == "rotation")]
 
 
-def collect_candidates(config, day, only=None, delay=None, raw_root=SHADOW_RAW):
+def collect_candidates(config, day, only=None, delay=None, raw_root=SHADOW_RAW,
+                       state_root=SHADOW_STATE, today=None):
+    today = today or date.today()
+    if date.fromisoformat(day) != today:
+        raise ValueError(
+            "拒绝为历史日期采集实时内容；历史日期只能使用 --report-only")
     selected = candidates_for_collection(config, only)
     day_dir = raw_root / day
     day_dir.mkdir(parents=True, exist_ok=True)
@@ -335,6 +342,7 @@ def collect_candidates(config, day, only=None, delay=None, raw_root=SHADOW_RAW):
         log = {}
     log = {"date": day, "started_at": log.get("started_at", datetime.now(timezone.utc).isoformat()),
            "sources": log.get("sources", {})}
+    successful = set()
     for path in day_dir.glob("*.json"):
         if path.name.startswith("_"):
             continue
@@ -343,18 +351,30 @@ def collect_candidates(config, day, only=None, delay=None, raw_root=SHADOW_RAW):
         except (OSError, json.JSONDecodeError):
             continue
         if old.get("status", "ok") == "ok":
-            log["sources"][old.get("source", path.stem)] = {
+            source_id = old.get("source", path.stem)
+            successful.add(source_id)
+            log["sources"][source_id] = {
                 "status": "ok", "items": len(old.get("items", []))}
 
     wait = config["audit"].get("request_delay_seconds", 2) if delay is None else delay
     old_state = fetch_l1.STATE_DIR
-    fetch_l1.STATE_DIR = SHADOW_STATE
+    old_cache_root = fetch_l1.HTTP_CACHE_ROOT
+    old_logical_day = fetch_l1.HTTP_LOGICAL_DAY
+    state_root = Path(state_root)
+    fetch_l1.STATE_DIR = state_root
+    fetch_l1.HTTP_CACHE_ROOT = state_root / "http_cache"
+    fetch_l1.HTTP_LOGICAL_DAY = day
     try:
-        for index, source in enumerate(selected):
-            if index and wait:
-                time.sleep(wait)
+        attempted = 0
+        for source in selected:
             sid = source["id"]
             output = day_dir / f"{sid}.json"
+            if sid in successful:
+                print(f"[skip] {sid}: 当日成功样本已存在", flush=True)
+                continue
+            if attempted and wait:
+                time.sleep(wait)
+            attempted += 1
             try:
                 fetcher = fetch_l1.FETCHERS[source["type"]]
                 items = fetcher(dict(source))
@@ -409,6 +429,8 @@ def collect_candidates(config, day, only=None, delay=None, raw_root=SHADOW_RAW):
                 print(f"[fail] {sid}: {error}", flush=True)
     finally:
         fetch_l1.STATE_DIR = old_state
+        fetch_l1.HTTP_CACHE_ROOT = old_cache_root
+        fetch_l1.HTTP_LOGICAL_DAY = old_logical_day
     log["finished_at"] = datetime.now(timezone.utc).isoformat()
     atomic_json(log_path, log)
     prune(raw_root, day, config["audit"].get("keep_days", 21))
@@ -951,7 +973,10 @@ def main():
             print(f"审计已完成 {len(complete)} 个完整采样日；停止抓取。最终报告：{path}")
             return 0
         if not args.report_only:
-            collect_candidates(config, args.date, only=only, delay=args.delay)
+            try:
+                collect_candidates(config, args.date, only=only, delay=args.delay)
+            except ValueError as error:
+                sys.exit(str(error))
         path, rows = generate_report(
             config, args.date, include_current_partial=bool(only))
         trials = {row["source_id"] for row in rows

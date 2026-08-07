@@ -13,7 +13,9 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import fetch_l1 as fl  # noqa: E402
-from http_fetch_state import load_entry, prune_cache, request_key, request_lease  # noqa: E402
+from http_fetch_state import (MAX_HTTP_DELTA_SECONDS, host_state_key,
+                              load_entry, prune_cache, request_key,
+                              request_lease)  # noqa: E402
 
 
 class HttpGetTest(unittest.TestCase):
@@ -30,9 +32,14 @@ class HttpGetTest(unittest.TestCase):
 
     def get(self, url, **kwargs):
         logical_day = kwargs.pop("logical_day", self.now.date().isoformat())
+        source = dict(kwargs.pop("source", None) or {})
+        # Redirect-heavy tests explicitly trust their synthetic target domains.
+        # Production calls do not receive this allowlist implicitly.
+        source.setdefault(
+            "allowed_redirect_hosts", ["*.example", "*.reddit.com"])
         return fl.http_get(
             url, cache_root=self.cache_root, now=self.now,
-            logical_day=logical_day, **kwargs)
+            logical_day=logical_day, source=source, **kwargs)
 
     @staticmethod
     def response(status=200, content=b"feed-v1", headers=None):
@@ -169,6 +176,18 @@ class HttpGetTest(unittest.TestCase):
             self.get(url)
         get.assert_called_once()
 
+    def test_large_max_age_is_saturated_without_date_overflow(self):
+        url = "https://status.example/large-freshness"
+        first = self.response(headers={
+            "Cache-Control": "max-age=9999999999999"})
+        with patch.object(fl.requests, "get", return_value=first):
+            self.get(url)
+
+        entry = load_entry(self.cache_root, request_key(url))
+        self.assertEqual(
+            entry.get("fresh_until"),
+            (self.now + timedelta(seconds=2 ** 31)).isoformat())
+
     def test_failure_cooldown_serves_explicit_stale_cache_without_new_request(self):
         first = self.response(headers={"ETag": '"v1"'})
         url = "https://status.example/feed.rss"
@@ -253,6 +272,500 @@ class HttpGetTest(unittest.TestCase):
         get.assert_called_once()
         self.assertEqual(response.content, b"back")
 
+    def test_410_tombstone_stops_automatic_polling_and_drops_cached_body(self):
+        url = "https://status.example/retired-feed.rss"
+        with patch.object(fl.requests, "get", return_value=self.response()):
+            self.get(url)
+
+        self.now += timedelta(minutes=31)
+        gone = requests.Response()
+        gone.status_code = 410
+        gone.url = url
+        gone._content = b"gone"
+        with patch.object(fl.requests, "get", return_value=gone):
+            with self.assertRaises(requests.HTTPError):
+                self.get(url)
+
+        entry = load_entry(self.cache_root, request_key(url))
+        self.assertEqual(entry.get("terminal_status"), 410)
+        self.assertEqual(entry.get("gone_at"), self.now.isoformat())
+        self.assertFalse(entry.get("body_sha256"))
+        self.assertFalse(entry.get("etag"))
+
+        fl.take_http_events()
+        self.now += timedelta(days=1)
+        with patch.object(fl.requests, "get") as get:
+            with self.assertRaises(fl.FetchGone):
+                self.get(url)
+        get.assert_not_called()
+        events = fl.take_http_events()
+        self.assertEqual(events[-1]["cache_status"], "deferred")
+        self.assertEqual(events[-1]["terminal_status"], 410)
+
+    def test_force_revalidate_can_recover_a_410_tombstone(self):
+        url = "https://status.example/revived-feed.rss"
+        gone = requests.Response()
+        gone.status_code = 410
+        gone.url = url
+        gone._content = b"gone"
+        with patch.object(fl.requests, "get", return_value=gone):
+            with self.assertRaises(requests.HTTPError):
+                self.get(url)
+
+        revived = self.response(content=b"revived", headers={"ETag": '"v2"'})
+        with patch.object(fl.requests, "get", return_value=revived) as get:
+            response = self.get(url, force_revalidate=True)
+
+        get.assert_called_once()
+        self.assertEqual(response.content, b"revived")
+        entry = load_entry(self.cache_root, request_key(url))
+        self.assertNotIn("terminal_status", entry)
+        self.assertNotIn("gone_at", entry)
+        self.assertEqual(entry.get("etag"), '"v2"')
+
+    def test_failed_manual_recheck_keeps_a_410_tombstone(self):
+        url = "https://status.example/still-retired.rss"
+        gone = requests.Response()
+        gone.status_code = 410
+        gone.url = url
+        gone._content = b"gone"
+        with patch.object(fl.requests, "get", return_value=gone):
+            with self.assertRaises(requests.HTTPError):
+                self.get(url)
+
+        unavailable = requests.Response()
+        unavailable.status_code = 503
+        unavailable.url = url
+        unavailable._content = b"unavailable"
+        with patch.object(fl.requests, "get", return_value=unavailable):
+            with self.assertRaises(requests.HTTPError):
+                self.get(url, force_revalidate=True)
+
+        entry = load_entry(self.cache_root, request_key(url))
+        self.assertEqual(entry.get("terminal_status"), 410)
+        self.now += timedelta(days=1)
+        with patch.object(fl.requests, "get") as get:
+            with self.assertRaises(fl.FetchGone):
+                self.get(url)
+        get.assert_not_called()
+
+    def test_blocked_manual_recheck_preserves_terminal_event_status(self):
+        url = "https://status.example/retired-during-host-cooldown"
+        gone = requests.Response()
+        gone.status_code = 410
+        gone.url = url
+        gone._content = b"gone"
+        with patch.object(fl.requests, "get", return_value=gone):
+            with self.assertRaises(requests.HTTPError):
+                self.get(url)
+
+        fl.take_http_events()
+        fl.record_host_cooldown(
+            self.cache_root, url, retry_after=3600, now=self.now,
+            error="HTTP 503")
+        with patch.object(fl.requests, "get") as get:
+            with self.assertRaises(fl.FetchCooldown):
+                self.get(url, force_revalidate=True)
+        get.assert_not_called()
+        summary = fl.summarize_http_events(fl.take_http_events())
+        self.assertEqual(summary["source_status"], "gone")
+        self.assertEqual(summary["terminal_statuses"], [410])
+
+    def test_lease_blocked_manual_recheck_preserves_terminal_event_status(self):
+        url = "https://status.example/retired-during-key-wait"
+        gone = requests.Response()
+        gone.status_code = 410
+        gone.url = url
+        gone._content = b"gone"
+        with patch.object(fl.requests, "get", return_value=gone):
+            with self.assertRaises(requests.HTTPError):
+                self.get(url)
+
+        fl.take_http_events()
+        with patch.object(
+                fl, "request_lease",
+                side_effect=fl.FetchCooldown("request lease busy")):
+            with patch.object(fl.requests, "get") as get:
+                with self.assertRaises(fl.FetchCooldown):
+                    self.get(url, force_revalidate=True)
+        get.assert_not_called()
+        summary = fl.summarize_http_events(fl.take_http_events())
+        self.assertEqual(summary["source_status"], "gone")
+        self.assertEqual(summary["terminal_statuses"], [410])
+
+    def test_invalid_manual_recheck_keeps_a_410_tombstone(self):
+        url = "https://status.example/still-retired-json"
+        gone = requests.Response()
+        gone.status_code = 410
+        gone.url = url
+        gone._content = b"gone"
+        with patch.object(fl.requests, "get", return_value=gone):
+            with self.assertRaises(requests.HTTPError):
+                self.get(url, response_kind="json")
+
+        challenge = requests.Response()
+        challenge.status_code = 200
+        challenge.url = url
+        challenge.headers["Content-Type"] = "text/html"
+        challenge._content = b"<html>challenge</html>"
+        with patch.object(fl.requests, "get", return_value=challenge):
+            with self.assertRaises(fl.ResponseValidationError):
+                self.get(
+                    url, force_revalidate=True, response_kind="json")
+
+        entry = load_entry(self.cache_root, request_key(url))
+        self.assertEqual(entry.get("terminal_status"), 410)
+        self.now += timedelta(days=1)
+        with patch.object(fl.requests, "get") as get:
+            with self.assertRaises(fl.FetchGone):
+                self.get(url, response_kind="json")
+        get.assert_not_called()
+
+    def test_unsafe_manual_recheck_keeps_a_410_tombstone(self):
+        url = "https://status.example/still-retired-unsafe"
+        gone = requests.Response()
+        gone.status_code = 410
+        gone.url = url
+        gone._content = b"gone"
+        with patch.object(fl.requests, "get", return_value=gone):
+            with self.assertRaises(requests.HTTPError):
+                self.get(url)
+
+        redirected = self.response(
+            status=302, content=b"",
+            headers={"Location": "http://127.0.0.1/private"})
+        redirected.url = url
+        with patch.object(fl.requests, "get", return_value=redirected):
+            with self.assertRaises(fl.UnsafeRedirectTarget):
+                self.get(url, force_revalidate=True)
+
+        entry = load_entry(self.cache_root, request_key(url))
+        self.assertEqual(entry.get("terminal_status"), 410)
+
+    def test_oversized_manual_recheck_keeps_a_410_tombstone(self):
+        url = "https://status.example/still-retired-large"
+        source = {"id": "bounded", "fetch_policy": {
+            "max_download_bytes": 4}}
+        gone = requests.Response()
+        gone.status_code = 410
+        gone.url = url
+        gone._content = b"gone"
+        with patch.object(fl.requests, "get", return_value=gone):
+            with self.assertRaises(requests.HTTPError):
+                self.get(url, source=source)
+
+        oversized = self.streamed_response([b"12345"], url=url)
+        with patch.object(fl.requests, "get", return_value=oversized):
+            with self.assertRaises(fl.ResponseTooLarge):
+                self.get(url, source=source, force_revalidate=True)
+
+        entry = load_entry(
+            self.cache_root, request_key(url, source_id="bounded"))
+        self.assertEqual(entry.get("terminal_status"), 410)
+
+    def test_410_cache_directives_can_forbid_tombstone_reuse(self):
+        cases = {
+            "no-store": {"Cache-Control": "no-store"},
+            "no-cache": {"Cache-Control": "no-cache"},
+            "must-revalidate": {"Cache-Control": "must-revalidate"},
+            "proxy-revalidate": {"Cache-Control": "proxy-revalidate"},
+            "vary-star": {"Vary": "*"},
+            "invalid-max-age": {"Cache-Control": "max-age=bogus"},
+            "bare-max-age": {"Cache-Control": "max-age"},
+            "spaced-max-age-key": {"Cache-Control": "max-age =60"},
+            "spaced-max-age-value": {"Cache-Control": "max-age= 60"},
+            "signed-max-age": {"Cache-Control": "max-age=+60"},
+            "signed-age": {"Cache-Control": "max-age=60", "Age": "+10"},
+            "negative-age": {"Cache-Control": "max-age=60", "Age": "-1"},
+            "duplicate-max-age": {
+                "Cache-Control": "max-age=0, max-age=3600"},
+        }
+        for label, headers in cases.items():
+            with self.subTest(label=label):
+                url = f"https://status.example/gone-{label}"
+                gone = requests.Response()
+                gone.status_code = 410
+                gone.url = url
+                gone.headers.update(headers)
+                gone._content = b"gone"
+                with patch.object(fl.requests, "get", return_value=gone):
+                    with self.assertRaises(requests.HTTPError):
+                        self.get(url)
+
+                entry = load_entry(self.cache_root, request_key(url))
+                self.assertNotIn("terminal_status", entry)
+                restored = self.response(content=b"restored")
+                restored.url = url
+                with patch.object(
+                        fl.requests, "get", return_value=restored) as get:
+                    self.assertEqual(self.get(url).content, b"restored")
+                get.assert_called_once()
+
+    def test_new_410_no_store_clears_an_existing_tombstone(self):
+        url = "https://status.example/gone-now-no-store"
+        gone = requests.Response()
+        gone.status_code = 410
+        gone.url = url
+        gone._content = b"gone"
+        with patch.object(fl.requests, "get", return_value=gone):
+            with self.assertRaises(requests.HTTPError):
+                self.get(url)
+
+        no_store = requests.Response()
+        no_store.status_code = 410
+        no_store.url = url
+        no_store.headers["Cache-Control"] = "no-store"
+        no_store._content = b"gone"
+        with patch.object(fl.requests, "get", return_value=no_store):
+            with self.assertRaises(requests.HTTPError):
+                self.get(url, force_revalidate=True)
+
+        entry = load_entry(self.cache_root, request_key(url))
+        self.assertNotIn("terminal_status", entry)
+        restored = self.response(content=b"restored")
+        restored.url = url
+        with patch.object(fl.requests, "get", return_value=restored) as get:
+            self.assertEqual(self.get(url).content, b"restored")
+        get.assert_called_once()
+
+    def test_410_explicit_freshness_expires_and_rechecks_origin(self):
+        url = "https://status.example/gone-temporarily"
+        gone = requests.Response()
+        gone.status_code = 410
+        gone.url = url
+        gone.headers.update({"Cache-Control": "max-age=60", "Age": "10"})
+        gone._content = b"gone"
+        with patch.object(fl.requests, "get", return_value=gone):
+            with self.assertRaises(requests.HTTPError):
+                self.get(url)
+
+        entry = load_entry(self.cache_root, request_key(url))
+        self.assertEqual(
+            entry.get("terminal_until"),
+            (self.now + timedelta(seconds=50)).isoformat())
+        self.now += timedelta(seconds=49)
+        with patch.object(fl.requests, "get") as get:
+            with self.assertRaises(fl.FetchGone):
+                self.get(url)
+        get.assert_not_called()
+
+        self.now += timedelta(seconds=2)
+        restored = self.response(content=b"restored")
+        restored.url = url
+        with patch.object(fl.requests, "get", return_value=restored) as get:
+            self.assertEqual(self.get(url).content, b"restored")
+        get.assert_called_once()
+
+    def test_410_large_delta_seconds_is_safely_saturated(self):
+        url = "https://status.example/gone-large-max-age"
+        gone = requests.Response()
+        gone.status_code = 410
+        gone.url = url
+        gone.headers["Cache-Control"] = "max-age=" + ("9" * 5000)
+        gone._content = b"gone"
+        with patch.object(fl.requests, "get", return_value=gone):
+            with self.assertRaises(requests.HTTPError):
+                self.get(url)
+
+        entry = load_entry(self.cache_root, request_key(url))
+        self.assertEqual(entry.get("terminal_status"), 410)
+        self.assertEqual(
+            entry.get("terminal_until"),
+            (self.now + timedelta(seconds=2 ** 31)).isoformat())
+
+    def test_410_expires_accounts_for_date_and_age(self):
+        self.now += timedelta(minutes=10)
+        url = "https://status.example/gone-aged-expires"
+        gone = requests.Response()
+        gone.status_code = 410
+        gone.url = url
+        gone.headers.update({
+            "Date": "Thu, 06 Aug 2026 12:00:00 GMT",
+            "Expires": "Thu, 06 Aug 2026 13:00:00 GMT",
+            "Age": "1800",
+        })
+        gone._content = b"gone"
+        with patch.object(fl.requests, "get", return_value=gone):
+            with self.assertRaises(requests.HTTPError):
+                self.get(url)
+
+        entry = load_entry(self.cache_root, request_key(url))
+        self.assertEqual(
+            entry.get("terminal_until"),
+            (self.now + timedelta(minutes=30)).isoformat())
+
+    def test_410_after_temporary_redirect_does_not_tombstone_origin(self):
+        for status in (302, 303, 307):
+            with self.subTest(status=status):
+                start = f"https://status.example/temporary-{status}.rss"
+                target = f"https://temporary.example/gone-{status}.rss"
+                moved = self.response(
+                    status=status, content=b"", headers={"Location": target})
+                moved.url = start
+                gone = requests.Response()
+                gone.status_code = 410
+                gone.url = target
+                gone._content = b"gone"
+                with patch.object(
+                        fl.socket, "getaddrinfo",
+                        return_value=self.dns_answers("93.184.216.34")):
+                    with patch.object(
+                            fl.requests, "get", side_effect=[moved, gone]):
+                        with self.assertRaises(requests.HTTPError):
+                            self.get(start)
+
+                entry = load_entry(self.cache_root, request_key(start))
+                self.assertNotIn("terminal_status", entry)
+                replacement = self.response(content=b"origin-restored")
+                replacement.url = start
+                with patch.object(
+                        fl.requests, "get", return_value=replacement) as get:
+                    response = self.get(start)
+                get.assert_called_once()
+                self.assertEqual(response.content, b"origin-restored")
+
+    def test_410_after_permanent_redirect_tombstones_configured_origin(self):
+        start = "https://status.example/permanent-redirect.rss"
+        target = "https://new.example/gone.rss"
+        moved = self.response(
+            status=301, content=b"", headers={"Location": target})
+        moved.url = start
+        gone = requests.Response()
+        gone.status_code = 410
+        gone.url = target
+        gone._content = b"gone"
+        with patch.object(
+                fl.socket, "getaddrinfo",
+                return_value=self.dns_answers("93.184.216.34")):
+            with patch.object(fl.requests, "get", side_effect=[moved, gone]):
+                with self.assertRaises(requests.HTTPError):
+                    self.get(start)
+
+        entry = load_entry(self.cache_root, request_key(start))
+        self.assertEqual(entry.get("terminal_status"), 410)
+        self.assertNotIn("permanent_redirect_url", entry)
+        self.now += timedelta(days=1)
+        with patch.object(fl.requests, "get") as get:
+            with self.assertRaises(fl.FetchGone):
+                self.get(start)
+        get.assert_not_called()
+
+    def test_410_permanent_chain_uses_earliest_freshness_deadline(self):
+        start = "https://status.example/permanent-expiring.rss"
+        target = "https://new.example/gone-expiring.rss"
+        moved = self.response(
+            status=308, content=b"", headers={
+                "Location": target, "Cache-Control": "max-age=30"})
+        moved.url = start
+        gone = requests.Response()
+        gone.status_code = 410
+        gone.url = target
+        gone.headers.update({"Cache-Control": "max-age=60"})
+        gone._content = b"gone"
+        with patch.object(
+                fl.socket, "getaddrinfo",
+                return_value=self.dns_answers("93.184.216.34")):
+            with patch.object(fl.requests, "get", side_effect=[moved, gone]):
+                with self.assertRaises(requests.HTTPError):
+                    self.get(start)
+
+        entry = load_entry(self.cache_root, request_key(start))
+        self.assertEqual(
+            entry.get("terminal_until"),
+            (self.now + timedelta(seconds=30)).isoformat())
+
+    def test_410_at_remembered_target_returns_to_configured_origin(self):
+        start = "https://status.example/remembered-gone.rss"
+        target = "https://new.example/remembered-gone.rss"
+        moved = self.response(
+            status=301, content=b"", headers={"Location": target})
+        moved.url = start
+        final = self.response()
+        final.url = target
+        public_dns = self.dns_answers("93.184.216.34")
+        with patch.object(fl.socket, "getaddrinfo", return_value=public_dns):
+            with patch.object(
+                    fl.requests, "get", side_effect=[moved, final]):
+                self.get(start)
+
+        gone = requests.Response()
+        gone.status_code = 410
+        gone.url = target
+        gone._content = b"gone"
+        with patch.object(fl.socket, "getaddrinfo", return_value=public_dns):
+            with patch.object(fl.requests, "get", return_value=gone) as get:
+                with self.assertRaises(requests.HTTPError):
+                    self.get(start, force_revalidate=True)
+        self.assertEqual(get.call_args.args[0], target)
+        entry = load_entry(self.cache_root, request_key(start))
+        self.assertNotIn("terminal_status", entry)
+        self.assertNotIn("permanent_redirect_url", entry)
+        self.assertFalse(entry.get("body_sha256"))
+
+        restored = self.response(content=b"origin-restored")
+        restored.url = start
+        with patch.object(fl.requests, "get", return_value=restored) as get:
+            self.assertEqual(self.get(start).content, b"origin-restored")
+        self.assertEqual(get.call_args.args[0], start)
+
+    def test_410_tombstone_survives_routine_cache_pruning(self):
+        url = "https://status.example/retired-forever.rss"
+        gone = requests.Response()
+        gone.status_code = 410
+        gone.url = url
+        gone._content = b"gone"
+        with patch.object(fl.requests, "get", return_value=gone):
+            with self.assertRaises(requests.HTTPError):
+                self.get(url)
+
+        result = prune_cache(
+            self.cache_root, now=self.now + timedelta(days=46),
+            max_age_days=45)
+
+        self.assertEqual(result["removed_entries"], 0)
+        entry = load_entry(self.cache_root, request_key(url))
+        self.assertEqual(entry.get("terminal_status"), 410)
+
+    def test_expired_410_tombstone_is_removed_by_routine_cache_pruning(self):
+        url = "https://status.example/expired-gone"
+        gone = requests.Response()
+        gone.status_code = 410
+        gone.url = url
+        gone.headers["Cache-Control"] = "max-age=60"
+        gone._content = b"gone"
+        with patch.object(fl.requests, "get", return_value=gone):
+            with self.assertRaises(requests.HTTPError):
+                self.get(url)
+
+        result = prune_cache(
+            self.cache_root, now=self.now + timedelta(days=46),
+            max_age_days=45)
+
+        self.assertEqual(result["removed_entries"], 1)
+        self.assertEqual(load_entry(self.cache_root, request_key(url)), {})
+
+    def test_410_tombstone_respects_disabled_http_state(self):
+        url = "https://status.example/gone-without-state"
+        source = {"id": "disabled", "fetch_policy": {"enabled": False}}
+        gone = requests.Response()
+        gone.status_code = 410
+        gone.url = url
+        gone._content = b"gone"
+        with patch.object(fl.requests, "get", return_value=gone):
+            with self.assertRaises(requests.HTTPError):
+                self.get(url, source=source)
+
+        self.assertEqual(
+            load_entry(
+                self.cache_root,
+                request_key(url, source_id="disabled")),
+            {})
+        restored = self.response(content=b"restored")
+        restored.url = url
+        with patch.object(fl.requests, "get", return_value=restored) as get:
+            self.assertEqual(self.get(url, source=source).content, b"restored")
+        get.assert_called_once()
+
     def test_source_http_summary_distinguishes_network_cache_and_stale(self):
         network = fl.summarize_http_events([
             {"cache_status": "revalidated", "network_attempts": 1,
@@ -270,6 +783,37 @@ class HttpGetTest(unittest.TestCase):
         self.assertEqual(network["network_attempts"], 1)
         self.assertEqual(cached["source_status"], "cached")
         self.assertEqual(stale["source_status"], "stale")
+
+    def test_source_http_summary_preserves_terminal_gone_status(self):
+        gone = fl.summarize_http_events([{
+            "cache_status": "deferred", "network_attempts": 0,
+            "terminal_status": 410,
+        }])
+        mixed = fl.summarize_http_events([
+            {"cache_status": "deferred", "network_attempts": 0,
+             "terminal_status": 410},
+            {"cache_status": "fresh", "network_attempts": 0},
+        ])
+        gone_with_other_error = fl.summarize_http_events([
+            {"cache_status": "deferred", "network_attempts": 0,
+             "terminal_status": 410},
+            {"cache_status": "error", "network_attempts": 1,
+             "error": "ConnectionError"},
+        ])
+        gone_with_other_deferred = fl.summarize_http_events([
+            {"cache_status": "deferred", "network_attempts": 0,
+             "terminal_status": 410},
+            {"cache_status": "deferred", "network_attempts": 0,
+             "retry_at": "2026-08-06T13:00:00+00:00"},
+        ])
+
+        self.assertEqual(gone["source_status"], "gone")
+        self.assertEqual(gone["terminal_statuses"], [410])
+        self.assertEqual(gone["usable_responses"], 0)
+        self.assertEqual(mixed["source_status"], "partial")
+        self.assertEqual(gone_with_other_error["source_status"], "error")
+        self.assertEqual(
+            gone_with_other_deferred["source_status"], "deferred")
 
     def test_source_http_summary_does_not_call_all_failures_success(self):
         failed = fl.summarize_http_events([
@@ -516,6 +1060,36 @@ class HttpGetTest(unittest.TestCase):
         get.assert_called_once()
         self.assertEqual(result.content, b"b" * 40)
 
+    def test_tightened_poll_interval_delays_an_old_earlier_deadline(self):
+        url = "https://interval.example/feed"
+        original = {"id": "paced", "fetch_policy": {
+            "adaptive": False,
+            "min_interval_minutes": 1,
+            "max_interval_minutes": 1,
+        }}
+        with patch.object(fl.requests, "get", return_value=self.response()):
+            self.get(url, source=original)
+
+        self.now += timedelta(minutes=2)
+        tightened = {"id": "paced", "fetch_policy": {
+            "adaptive": False,
+            "min_interval_minutes": 60,
+            "max_interval_minutes": 60,
+        }}
+        with patch.object(fl.requests, "get") as get:
+            cached = self.get(url, source=tightened)
+
+        get.assert_not_called()
+        self.assertEqual(cached.content, b"feed-v1")
+
+        self.now += timedelta(minutes=58)
+        replacement = self.response(content=b"feed-v2")
+        with patch.object(fl.requests, "get", return_value=replacement) as get:
+            refreshed = self.get(url, source=tightened)
+
+        get.assert_called_once()
+        self.assertEqual(refreshed.content, b"feed-v2")
+
     def test_tightened_download_cap_rejects_larger_304_body(self):
         url = "https://stream.example/tightened-304"
         source = {"id": "bounded", "fetch_policy": {"max_download_bytes": 100}}
@@ -642,6 +1216,12 @@ class HttpGetTest(unittest.TestCase):
             "proxy-revalidate": {"Cache-Control": "proxy-revalidate"},
             "vary-star": {"Vary": "*"},
             "invalid-max-age": {"Cache-Control": "max-age=bogus"},
+            "bare-max-age": {"Cache-Control": "max-age"},
+            "spaced-max-age-key": {"Cache-Control": "max-age =60"},
+            "spaced-max-age-value": {"Cache-Control": "max-age= 60"},
+            "signed-max-age": {"Cache-Control": "max-age=+60"},
+            "signed-age": {"Cache-Control": "max-age=60", "Age": "+10"},
+            "negative-age": {"Cache-Control": "max-age=60", "Age": "-1"},
             "duplicate-max-age": {
                 "Cache-Control": "max-age=0, max-age=3600"},
             "invalid-expires": {"Expires": "0"},
@@ -982,6 +1562,51 @@ class HttpGetTest(unittest.TestCase):
         self.assertTrue(entry.get("retry_at"))
         self.assertFalse(entry.get("allow_stale"))
 
+    def test_cross_host_redirect_requires_explicit_config_trust(self):
+        start = "https://configured.example/feed"
+        target = "https://rebind.example/feed"
+        redirected = self.response(
+            status=302, content=b"", headers={"Location": target})
+        redirected.url = start
+        final = self.response(content=b"should-not-be-reached")
+        final.url = target
+
+        with patch.object(fl.socket, "getaddrinfo") as dns:
+            with patch.object(
+                    fl.requests, "get",
+                    side_effect=[redirected, final]) as get:
+                with self.assertRaises(fl.UnsafeRedirectTarget):
+                    fl.http_get(
+                        start, cache_root=self.cache_root, now=self.now,
+                        logical_day=self.now.date().isoformat(), source={})
+
+        get.assert_called_once()
+        dns.assert_not_called()
+
+    def test_explicitly_trusted_cross_host_redirect_still_checks_public_dns(self):
+        start = "https://configured.example/feed"
+        target = "https://trusted.example/feed"
+        redirected = self.response(
+            status=302, content=b"", headers={"Location": target})
+        redirected.url = start
+        final = self.response(content=b"trusted-target")
+        final.url = target
+        source = {"allowed_redirect_hosts": ["trusted.example"]}
+
+        with patch.object(
+                fl.socket, "getaddrinfo",
+                return_value=self.dns_answers("93.184.216.34")) as dns:
+            with patch.object(
+                    fl.requests, "get",
+                    side_effect=[redirected, final]) as get:
+                response = fl.http_get(
+                    start, cache_root=self.cache_root, now=self.now,
+                    logical_day=self.now.date().isoformat(), source=source)
+
+        self.assertEqual(response.content, b"trusted-target")
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(dns.call_count, 2)
+
     def test_redirect_with_any_private_dns_answer_is_blocked(self):
         start = "https://redirect.example/feed"
         target = "https://mixed.example/feed"
@@ -1012,6 +1637,64 @@ class HttpGetTest(unittest.TestCase):
 
         self.assertEqual(dns.call_count, 2)
         get.assert_called_once()
+
+    def test_redirect_connection_uses_the_second_validated_dns_answers(self):
+        start = "https://redirect.example/feed"
+        target = "https://rebound.example/feed"
+        redirected = self.response(
+            status=302, content=b"", headers={"Location": target})
+        redirected.url = start
+        final = self.response(content=b"pinned")
+        final.url = target
+        public = self.dns_answers("93.184.216.34")
+        private = self.dns_answers("127.0.0.1")
+        connected = []
+
+        def fake_get(request_url, **kwargs):
+            if request_url == start:
+                return redirected
+            connected.extend(fl.socket.getaddrinfo(
+                "rebound.example", 443, type=fl.socket.SOCK_STREAM))
+            return final
+
+        with patch.object(
+                fl.socket, "getaddrinfo",
+                side_effect=[public, public, private]) as dns:
+            with patch.object(fl.requests, "get", side_effect=fake_get):
+                response = self.get(start)
+
+        self.assertEqual(response.content, b"pinned")
+        self.assertEqual(dns.call_count, 2)
+        self.assertEqual(connected[0][4][0], "93.184.216.34")
+
+    def test_same_host_redirect_connection_is_also_dns_pinned(self):
+        start = "https://feed.example/old"
+        target = "https://feed.example/new"
+        redirected = self.response(
+            status=302, content=b"", headers={"Location": target})
+        redirected.url = start
+        final = self.response(content=b"same-host-pinned")
+        final.url = target
+        public = self.dns_answers("93.184.216.34")
+        private = self.dns_answers("127.0.0.1")
+        connected = []
+
+        def fake_get(request_url, **kwargs):
+            if request_url == start:
+                return redirected
+            connected.extend(fl.socket.getaddrinfo(
+                "feed.example", 443, type=fl.socket.SOCK_STREAM))
+            return final
+
+        with patch.object(
+                fl.socket, "getaddrinfo",
+                side_effect=[public, public, private]) as dns:
+            with patch.object(fl.requests, "get", side_effect=fake_get):
+                response = self.get(start)
+
+        self.assertEqual(response.content, b"same-host-pinned")
+        self.assertEqual(dns.call_count, 2)
+        self.assertEqual(connected[0][4][0], "93.184.216.34")
 
     def test_redirect_rejects_credentials_and_nonstandard_ports(self):
         for target in (
@@ -1110,6 +1793,53 @@ class HttpGetTest(unittest.TestCase):
             with self.assertRaises(requests.RequestException):
                 self.get("https://limited.example/another")
         get.assert_not_called()
+
+    def test_huge_retry_after_is_saturated_without_masking_http_error(self):
+        url = "https://limited.example/huge-retry-after"
+        limited = requests.Response()
+        limited.status_code = 503
+        limited.url = url
+        limited.headers["Retry-After"] = "9" * 100
+        limited._content = b"unavailable"
+
+        with patch.object(fl.requests, "get", return_value=limited):
+            with self.assertRaises(requests.HTTPError):
+                self.get(url)
+
+        host_entry = load_entry(self.cache_root, host_state_key(url))
+        self.assertEqual(
+            host_entry.get("blocked_until"),
+            (self.now + timedelta(
+                seconds=MAX_HTTP_DELTA_SECONDS)).isoformat())
+
+    def test_retry_after_delta_seconds_rejects_signed_values(self):
+        self.assertEqual(
+            fl.retry_after_seconds({"Retry-After": "+60"}, self.now), 0)
+        self.assertEqual(
+            fl.retry_after_seconds({"Retry-After": "-1"}, self.now), 0)
+
+    def test_second_429_http_date_is_not_shifted_by_the_first_wait(self):
+        url = "https://limited.example/dated-retry"
+        first = requests.Response()
+        first.status_code = 429
+        first.url = url
+        first.headers["Retry-After"] = "1"
+        first._content = b"limited"
+        second = requests.Response()
+        second.status_code = 429
+        second.url = url
+        second.headers["Retry-After"] = "Thu, 06 Aug 2026 12:01:00 GMT"
+        second._content = b"still limited"
+
+        with patch.object(fl.requests, "get", side_effect=[first, second]):
+            with patch.object(fl.time, "sleep"):
+                with self.assertRaises(requests.HTTPError):
+                    self.get(url)
+
+        host_entry = load_entry(self.cache_root, host_state_key(url))
+        self.assertEqual(
+            host_entry.get("blocked_until"),
+            (self.now + timedelta(minutes=1)).isoformat())
 
     def test_lease_owner_does_not_unlink_a_successor_lock(self):
         key = "owner-token"
@@ -1249,6 +1979,47 @@ class HttpGetTest(unittest.TestCase):
         self.assertEqual(results, [b"one-network-response"] * 2)
         get.assert_called_once()
 
+    def test_concurrent_410_calls_create_one_tombstone_with_one_request(self):
+        url = "https://status.example/concurrent-gone"
+        entered = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def slow_get(*args, **kwargs):
+            entered.set()
+            release.wait(timeout=2)
+            gone = requests.Response()
+            gone.status_code = 410
+            gone.url = url
+            gone._content = b"gone"
+            return gone
+
+        def worker():
+            try:
+                self.get(url, force_revalidate=True)
+            except Exception as error:  # pragma: no cover - assertions report details
+                errors.append(error)
+
+        with patch.object(fl.requests, "get", side_effect=slow_get) as get:
+            first = threading.Thread(target=worker)
+            second = threading.Thread(target=worker)
+            first.start()
+            self.assertTrue(entered.wait(timeout=1))
+            second.start()
+            time.sleep(0.1)
+            release.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(any(isinstance(error, requests.HTTPError)
+                            for error in errors))
+        self.assertTrue(any(isinstance(error, fl.FetchGone)
+                            for error in errors))
+        get.assert_called_once()
+        entry = load_entry(self.cache_root, request_key(url))
+        self.assertEqual(entry.get("terminal_status"), 410)
+
     def test_cache_pruning_removes_unreferenced_body_but_keeps_current_entry(self):
         url = "https://status.example/feed.rss"
         with patch.object(fl.requests, "get", return_value=self.response(content=b"v1")):
@@ -1279,6 +2050,69 @@ class HttpGetTest(unittest.TestCase):
 
         self.assertEqual(item["summary"], "[link]")
         self.assertEqual(item["external_urls"], ["https://arxiv.org/abs/2608.00001"])
+
+    def test_rss_x_link_fallback_rejects_untrusted_item_host_before_network(self):
+        source = {
+            "id": "feed", "url": "https://feed.example/rss",
+            "mine_x_links": True,
+        }
+        feed = requests.Response()
+        feed.status_code = 200
+        feed.url = source["url"]
+        feed._content = b'''<?xml version="1.0"?>
+<rss version="2.0"><channel><item>
+  <title>Injected link</title>
+  <link>https://public.example/private</link>
+  <description>No status link here</description>
+</item></channel></rss>'''
+
+        with patch.object(fl.socket, "getaddrinfo") as dns:
+            with patch.object(fl.requests, "get", return_value=feed) as get:
+                items = fl.fetch_rss(source)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["x_links"], [])
+        get.assert_called_once()
+        dns.assert_not_called()
+
+    def test_rss_x_link_fallback_pins_same_host_article_connection(self):
+        source = {
+            "id": "feed", "url": "https://feed.example/rss",
+            "mine_x_links": True,
+        }
+        article_url = "https://feed.example/post"
+        feed = requests.Response()
+        feed.status_code = 200
+        feed.url = source["url"]
+        feed._content = f'''<?xml version="1.0"?>
+<rss version="2.0"><channel><item>
+  <title>Post</title><link>{article_url}</link>
+  <description>No status link here</description>
+</item></channel></rss>'''.encode()
+        article = requests.Response()
+        article.status_code = 200
+        article.url = article_url
+        article._content = b'https://x.com/example/status/12345'
+        public = self.dns_answers("93.184.216.34")
+        private = self.dns_answers("127.0.0.1")
+        connected = []
+
+        def fake_get(request_url, **kwargs):
+            if request_url == source["url"]:
+                return feed
+            connected.extend(fl.socket.getaddrinfo(
+                "feed.example", 443, type=fl.socket.SOCK_STREAM))
+            return article
+
+        with patch.object(
+                fl.socket, "getaddrinfo",
+                side_effect=[public, public, private]) as dns:
+            with patch.object(fl.requests, "get", side_effect=fake_get):
+                items = fl.fetch_rss(source)
+
+        self.assertEqual(items[0]["x_links"], ["x.com/example/status/12345"])
+        self.assertEqual(dns.call_count, 2)
+        self.assertEqual(connected[0][4][0], "93.184.216.34")
 
     def test_rss_exposes_full_text_only_when_audit_requests_it(self):
         long_body = "x" * 2200 + " controlled experiment benchmark at the tail"

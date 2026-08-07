@@ -46,6 +46,103 @@ TOPICS = {
 
 
 class SourcePartitionAuditTest(unittest.TestCase):
+    def test_collection_uses_isolated_http_state_and_logical_day(self):
+        config = {
+            "audit": {"keep_days": 21, "request_delay_seconds": 0},
+            "candidates": [{
+                "id": "candidate", "name": "Candidate", "type": "state_test",
+                "tier": "community", "enabled": True,
+            }],
+        }
+        seen = {}
+
+        def fetcher(source):
+            seen["state"] = audit.fetch_l1.STATE_DIR
+            seen["cache"] = audit.fetch_l1.HTTP_CACHE_ROOT
+            seen["day"] = audit.fetch_l1.HTTP_LOGICAL_DAY
+            return []
+
+        old_fetcher = audit.fetch_l1.FETCHERS.get("state_test")
+        old_state = audit.fetch_l1.STATE_DIR
+        old_cache = audit.fetch_l1.HTTP_CACHE_ROOT
+        old_day = audit.fetch_l1.HTTP_LOGICAL_DAY
+        audit.fetch_l1.FETCHERS["state_test"] = fetcher
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                state = root / "shadow-state"
+                audit.collect_candidates(
+                    config, "2026-08-05", delay=0, raw_root=root / "raw",
+                    state_root=state, today=date(2026, 8, 5))
+        finally:
+            if old_fetcher is None:
+                audit.fetch_l1.FETCHERS.pop("state_test", None)
+            else:
+                audit.fetch_l1.FETCHERS["state_test"] = old_fetcher
+
+        self.assertEqual(seen, {
+            "state": state,
+            "cache": state / "http_cache",
+            "day": "2026-08-05",
+        })
+        self.assertEqual(audit.fetch_l1.STATE_DIR, old_state)
+        self.assertEqual(audit.fetch_l1.HTTP_CACHE_ROOT, old_cache)
+        self.assertEqual(audit.fetch_l1.HTTP_LOGICAL_DAY, old_day)
+
+    def test_same_day_success_is_not_fetched_again(self):
+        config = {
+            "audit": {"keep_days": 21, "request_delay_seconds": 0},
+            "candidates": [{
+                "id": "candidate", "name": "Candidate", "type": "rerun_test",
+                "tier": "community", "enabled": True,
+            }],
+        }
+        fetcher = Mock(return_value=[])
+        old_fetcher = audit.fetch_l1.FETCHERS.get("rerun_test")
+        audit.fetch_l1.FETCHERS["rerun_test"] = fetcher
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                kwargs = {
+                    "delay": 0, "raw_root": root / "raw",
+                    "state_root": root / "state", "today": date(2026, 8, 5),
+                }
+                audit.collect_candidates(config, "2026-08-05", **kwargs)
+                audit.collect_candidates(config, "2026-08-05", **kwargs)
+        finally:
+            if old_fetcher is None:
+                audit.fetch_l1.FETCHERS.pop("rerun_test", None)
+            else:
+                audit.fetch_l1.FETCHERS["rerun_test"] = old_fetcher
+
+        fetcher.assert_called_once()
+
+    def test_collection_rejects_historical_sample_day_before_fetch(self):
+        config = {
+            "audit": {"keep_days": 21, "request_delay_seconds": 0},
+            "candidates": [{
+                "id": "candidate", "name": "Candidate", "type": "history_test",
+                "tier": "community", "enabled": True,
+            }],
+        }
+        fetcher = Mock(return_value=[])
+        old_fetcher = audit.fetch_l1.FETCHERS.get("history_test")
+        audit.fetch_l1.FETCHERS["history_test"] = fetcher
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaisesRegex(ValueError, "历史日期"):
+                    audit.collect_candidates(
+                        config, "2026-08-04", delay=0,
+                        raw_root=Path(tmp) / "raw", state_root=Path(tmp) / "state",
+                        today=date(2026, 8, 5))
+        finally:
+            if old_fetcher is None:
+                audit.fetch_l1.FETCHERS.pop("history_test", None)
+            else:
+                audit.fetch_l1.FETCHERS["history_test"] = old_fetcher
+
+        fetcher.assert_not_called()
+
     def test_named_low_frequency_author_has_auditable_policy(self):
         config = audit.load_config()
         source = next(s for s in config["candidates"] if s["id"] == "trial_lilian_weng")
@@ -139,7 +236,9 @@ class SourcePartitionAuditTest(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                audit.collect_candidates(config, "2026-08-05", delay=0, raw_root=root)
+                audit.collect_candidates(
+                    config, "2026-08-05", delay=0, raw_root=root,
+                    state_root=root / "state", today=date(2026, 8, 5))
                 payload = json.loads(
                     (root / "2026-08-05" / "author.json").read_text(encoding="utf-8"))
         finally:
@@ -155,6 +254,7 @@ class SourcePartitionAuditTest(unittest.TestCase):
 
     def test_expert_body_fallback_is_bounded_and_ephemeral(self):
         source = {
+            "id": "author", "url": "https://author.test/feed.xml",
             "track": "expert_author", "audit_body_fallback_items": 1,
             "audit_body_fallback_delay_seconds": 0,
         }
@@ -166,13 +266,36 @@ class SourcePartitionAuditTest(unittest.TestCase):
             text=("<html><body>controlled experiment benchmark baseline "
                   '<a href="https://arxiv.org/abs/2608.00001">paper</a></body></html>'),
             encoding="utf-8", apparent_encoding="utf-8")
-        with patch.object(audit.fetch_l1, "http_get", return_value=response):
+        with patch.object(
+                audit.fetch_l1, "http_get", return_value=response) as get:
             audit.hydrate_expert_fulltext(source, items)
+        get.assert_called_once_with(
+            "https://author.test/post",
+            accept="text/html,application/xhtml+xml",
+            source=source,
+            trusted_parent_url="https://author.test/feed.xml")
         audit.annotate_candidate_items(source, items)
 
         self.assertNotIn("_audit_fulltext", items[0])
         self.assertIn("https://arxiv.org/abs/2608.00001", items[0]["external_urls"])
         self.assertGreaterEqual(len(items[0]["expert_features"]["method_hits"]), 2)
+
+    def test_expert_body_fallback_rejects_private_item_url_before_network(self):
+        source = {
+            "id": "author", "url": "https://author.test/feed.xml",
+            "track": "expert_author", "audit_body_fallback_items": 1,
+            "audit_body_fallback_delay_seconds": 0,
+        }
+        items = [{"url": "http://127.0.0.1/private", "_audit_fulltext": "short"}]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with (patch.object(
+                    audit.fetch_l1, "HTTP_CACHE_ROOT", Path(tmp) / "http-cache"),
+                  patch.object(audit.fetch_l1.requests, "get") as get):
+                audit.hydrate_expert_fulltext(source, items)
+
+        get.assert_not_called()
+        self.assertIn("UnsafeRedirectTarget", items[0]["_audit_body_error"])
 
     def test_expert_router_separates_firsthand_test_from_synthesis(self):
         def payload(item):

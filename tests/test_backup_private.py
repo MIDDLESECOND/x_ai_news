@@ -73,6 +73,28 @@ class BackupPrivateTest(unittest.TestCase):
             with self.assertRaises(subprocess.CalledProcessError):
                 run_git(backup, "ls-files", "--error-unmatch", "reports/current.md")
 
+    def test_backup_includes_compact_reddit_audit_baseline(self):
+        with tempfile.TemporaryDirectory() as td:
+            source, backup = self.make_repos(td)
+            baseline = source / "data/reddit_audit/l1_baseline/2026-08-05.json"
+            baseline.parent.mkdir(parents=True)
+            baseline.write_text('{"version":1,"items":[]}\n', encoding="utf-8")
+            (baseline.parent / ".refresh.lock").write_text(
+                "pid=123\n", encoding="utf-8")
+
+            manifest, _ = snapshot_manifest(source, "2026-08-05")
+            self.assertIn(
+                "data/reddit_audit/l1_baseline/2026-08-05.json", manifest)
+            self.assertNotIn(
+                "data/reddit_audit/l1_baseline/.refresh.lock", manifest)
+            perform_backup(self.args(source), root=source,
+                           backup_repo=backup, push=False)
+
+            self.assertEqual(
+                (backup / "data/reddit_audit/l1_baseline/2026-08-05.json")
+                .read_text(encoding="utf-8"),
+                baseline.read_text(encoding="utf-8"))
+
     def test_no_change_run_still_verifies_existing_commit(self):
         with tempfile.TemporaryDirectory() as td:
             source, backup = self.make_repos(td)
