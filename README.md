@@ -131,6 +131,9 @@ Register-ScheduledTask -TaskName "FrontierRadar-L1" -Action $action, $action2 -T
 - **统一收尾**：`finalize_daily.py` 在分诊和派生完成后计算产物指纹，镜像并核验私有仓库工作区与 Git 提交树，再用独立同步确认标记闭合最终回执；月度复盘自动选择上一个完整月份。
 - **信源发现**：不锁死在固定账号清单。聚合信源的引文作者自动累计（`data/candidates_ledger.json`，私有），达到阈值后提名、人工确认晋升。
 - **三条写作纪律**（见 [AGENTS.md](AGENTS.md)）：归因检查、警惕整齐结构、正确优先于连贯。
+- **设计参考与致谢**：受哪些开源项目启发、具体借鉴边界及许可证核对记录见
+  [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md)。概念借鉴不冒充代码移植；若未来直接复用
+  代码或材料，必须在对应文件和致谢清单中补齐来源与许可证义务。
 
 ## 已知信源状态（2026-08-01 验证）
 
